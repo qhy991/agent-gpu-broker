@@ -129,12 +129,27 @@ class BrokerServer:
             for key, value in env.items()
         ):
             raise ValueError("env must map strings to strings")
+        label = request["label"]
+        if not isinstance(label, str) or not label.strip():
+            raise ValueError("label must be a non-empty string")
+        mode = request["mode"]
+        if mode not in {"shared", "exclusive"}:
+            raise ValueError("mode must be 'shared' or 'exclusive'")
+        gpu_count = request["gpu_count"]
+        if (
+            not isinstance(gpu_count, int)
+            or isinstance(gpu_count, bool)
+            or gpu_count < 1
+        ):
+            raise ValueError("gpu_count must be a positive integer")
         queue_timeout = request.get("queue_timeout_s")
         return JobSpec(
             argv=tuple(argv),
             cwd=str(request["cwd"]),
             owner=str(request.get("owner") or "unknown"),
-            label=str(request.get("label") or argv[0]),
+            label=label.strip(),
+            mode=mode,
+            gpu_count=gpu_count,
             estimate_s=max(1.0, float(request.get("estimate_s", 600.0))),
             run_timeout_s=max(1.0, float(request.get("run_timeout_s", 900.0))),
             queue_timeout_s=(

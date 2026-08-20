@@ -5,7 +5,7 @@ After=default.target
 [Service]
 Type=simple
 WorkingDirectory=/home/qinhaiyan/agent-gpu-broker
-ExecStart=/home/qinhaiyan/agent-gpu-broker/bin/gpuq serve --socket /tmp/agent-gpu-broker.sock --state-dir /home/qinhaiyan/.local/share/agent-gpu-broker --lock-dir /tmp/kda-gpu-locks
+ExecStart=/home/qinhaiyan/agent-gpu-broker/bin/gpuq serve --socket /tmp/agent-gpu-broker.sock --state-dir /home/qinhaiyan/.local/share/agent-gpu-broker --lock-dir /tmp/kda-gpu-locks --shared-capacity 2
 Restart=on-failure
 RestartSec=2
 UMask=0007

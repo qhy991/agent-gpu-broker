@@ -17,6 +17,8 @@ from typing import Any
 
 from .gpu import CardLock, GpuInventory, NvidiaSmiInventory, try_card_lock
 
+MODES = frozenset({"shared", "exclusive"})
+
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -28,6 +30,8 @@ class JobSpec:
     cwd: str
     owner: str
     label: str
+    mode: str
+    gpu_count: int
     estimate_s: float
     run_timeout_s: float
     queue_timeout_s: float | None
@@ -42,12 +46,11 @@ class Job:
     submitted_at: str
     submitted_mono: float
     state: str = "queued"
-    gpu_id: int | None = None
+    gpu_ids: tuple[int, ...] = ()
     started_at: str | None = None
     started_mono: float | None = None
     process: asyncio.subprocess.Process | None = None
     task: asyncio.Task[None] | None = None
-    card_lock: CardLock | None = None
     last_queue_key: tuple[Any, ...] | None = None
     last_notice_mono: float = 0.0
 
@@ -85,6 +88,8 @@ class StateStore:
                 "submitted_at": job.submitted_at,
                 "owner": job.spec.owner,
                 "label": job.spec.label,
+                "mode": job.spec.mode,
+                "gpu_count": job.spec.gpu_count,
                 "cwd": job.spec.cwd,
                 "argv": list(job.spec.argv),
                 "env_keys": sorted(job.spec.env),
@@ -119,21 +124,27 @@ class GpuBroker:
         lock_dir: Path,
         inventory: GpuInventory | None = None,
         gpu_ids: list[int] | None = None,
+        shared_capacity: int = 2,
         poll_interval_s: float = 2.0,
         heartbeat_s: float = 30.0,
         terminate_grace_s: float = 5.0,
     ) -> None:
+        if shared_capacity < 1:
+            raise ValueError("shared_capacity must be positive")
         self._store = StateStore(state_dir)
         self._lock_dir = lock_dir
         self._inventory = inventory or NvidiaSmiInventory()
         self._configured_gpu_ids = list(gpu_ids) if gpu_ids is not None else None
         self._gpu_ids: list[int] = []
+        self._shared_capacity = shared_capacity
         self._poll_interval_s = poll_interval_s
         self._heartbeat_s = heartbeat_s
         self._terminate_grace_s = terminate_grace_s
         self._jobs: dict[str, Job] = {}
         self._queue: deque[Job] = deque()
-        self._running: dict[int, Job] = {}
+        self._running_jobs: dict[str, Job] = {}
+        self._gpu_jobs: dict[int, list[Job]] = {}
+        self._gpu_locks: dict[int, CardLock] = {}
         self._recent: deque[dict[str, Any]] = deque(maxlen=20)
         self._gpu_observation: dict[int, dict[str, Any]] = {}
         self._probe_error: str | None = None
@@ -152,6 +163,8 @@ class GpuBroker:
             self._gpu_ids = list(self._configured_gpu_ids)
         if not self._gpu_ids:
             raise RuntimeError("no NVIDIA GPUs discovered or configured")
+        if len(set(self._gpu_ids)) != len(self._gpu_ids):
+            raise RuntimeError("configured GPU indices must be unique")
         self._scheduler = asyncio.create_task(
             self._scheduler_loop(), name="gpuq-scheduler"
         )
@@ -162,11 +175,14 @@ class GpuBroker:
         if self._closed:
             return
         self._closed = True
-        for job_id in list(self._jobs):
-            await self.cancel(job_id, reason="broker shutdown")
         if self._scheduler is not None:
             self._scheduler.cancel()
             await asyncio.gather(self._scheduler, return_exceptions=True)
+        for job_id in list(self._jobs):
+            await self.cancel(job_id, reason="broker shutdown")
+        for card_lock in self._gpu_locks.values():
+            card_lock.release()
+        self._gpu_locks.clear()
         self._write_status()
 
     def submit(self, spec: JobSpec) -> Job:
@@ -176,6 +192,20 @@ class GpuBroker:
             raise ValueError("command is empty")
         if not Path(spec.cwd).is_absolute():
             raise ValueError("cwd must be an absolute path")
+        if not isinstance(spec.label, str) or not spec.label.strip():
+            raise ValueError("label is required")
+        if spec.mode not in MODES:
+            raise ValueError("mode must be 'shared' or 'exclusive'")
+        if (
+            not isinstance(spec.gpu_count, int)
+            or isinstance(spec.gpu_count, bool)
+            or spec.gpu_count < 1
+        ):
+            raise ValueError("gpu_count must be a positive integer")
+        if spec.gpu_count > len(self._gpu_ids):
+            raise ValueError(
+                f"gpu_count={spec.gpu_count} exceeds managed GPUs={len(self._gpu_ids)}"
+            )
         job = Job(
             job_id=f"gpuq-{uuid.uuid4().hex[:12]}",
             spec=spec,
@@ -186,7 +216,16 @@ class GpuBroker:
         self._jobs[job.job_id] = job
         self._queue.append(job)
         self._store.record_request(job)
-        self._emit(job, {"type": "accepted", "job_id": job.job_id})
+        self._emit(
+            job,
+            {
+                "type": "accepted",
+                "job_id": job.job_id,
+                "label": job.spec.label,
+                "mode": job.spec.mode,
+                "gpu_count": job.spec.gpu_count,
+            },
+        )
         self._record_lifecycle(job, "accepted")
         self._publish_queue(force=True)
         self._write_status()
@@ -212,10 +251,14 @@ class GpuBroker:
     def snapshot(self) -> dict[str, Any]:
         now = time.monotonic()
         eta = self._queue_eta(now)
+        running = sorted(
+            self._running_jobs.values(), key=lambda job: job.started_mono or 0.0
+        )
         return {
-            "version": 1,
+            "version": 2,
             "updated_at": _utc_now(),
             "probe_error": self._probe_error,
+            "shared_capacity": self._shared_capacity,
             "gpus": [
                 {
                     "gpu_id": gpu_id,
@@ -223,7 +266,7 @@ class GpuBroker:
                 }
                 for gpu_id in self._gpu_ids
             ],
-            "running": [self._public_job(job, now) for job in self._running.values()],
+            "running": [self._public_job(job, now) for job in running],
             "queue": [
                 {
                     **self._public_job(job, now),
@@ -239,7 +282,7 @@ class GpuBroker:
         while True:
             self._wakeup.clear()
             self._expire_queued_jobs()
-            await self._schedule_clean_cards()
+            await self._schedule_jobs()
             self._publish_queue(force=False)
             self._write_status()
             try:
@@ -265,7 +308,7 @@ class GpuBroker:
                 retained.append(job)
         self._queue = retained
 
-    async def _schedule_clean_cards(self) -> None:
+    async def _schedule_jobs(self) -> None:
         try:
             occupancy = await self._inventory.compute_pids()
         except Exception as exc:  # fail closed when cleanliness is unknown
@@ -277,16 +320,91 @@ class GpuBroker:
             return
 
         self._probe_error = None
+        while self._queue:
+            job = self._queue[0]
+            gpu_ids = self._try_allocate(job, occupancy)
+            if gpu_ids is None:
+                break
+            self._queue.popleft()
+            self._start_job(job, gpu_ids)
+        self._gpu_observation = self._observe_gpus(occupancy)
+
+    def _try_allocate(
+        self, job: Job, occupancy: dict[int, list[int]]
+    ) -> tuple[int, ...] | None:
+        selected: list[int] = []
+        if job.spec.mode == "shared":
+            shared_cards = sorted(
+                (
+                    gpu_id
+                    for gpu_id, jobs in self._gpu_jobs.items()
+                    if jobs
+                    and all(item.spec.mode == "shared" for item in jobs)
+                    and len(jobs) < self._shared_capacity
+                ),
+                key=lambda gpu_id: (-len(self._gpu_jobs[gpu_id]), gpu_id),
+            )
+            selected.extend(shared_cards[: job.spec.gpu_count])
+
+        needed = job.spec.gpu_count - len(selected)
+        acquired: dict[int, CardLock] = {}
+        if needed:
+            free_cards = [
+                gpu_id
+                for gpu_id in self._gpu_ids
+                if gpu_id not in self._gpu_jobs
+                and gpu_id not in selected
+                and not occupancy.get(gpu_id, [])
+            ]
+            for gpu_id in free_cards:
+                card_lock = try_card_lock(gpu_id, self._lock_dir)
+                if card_lock is None:
+                    continue
+                acquired[gpu_id] = card_lock
+                selected.append(gpu_id)
+                if len(selected) == job.spec.gpu_count:
+                    break
+
+        if len(selected) != job.spec.gpu_count:
+            for card_lock in acquired.values():
+                card_lock.release()
+            return None
+
+        self._gpu_locks.update(acquired)
+        return tuple(selected)
+
+    def _start_job(self, job: Job, gpu_ids: tuple[int, ...]) -> None:
+        job.state = "running"
+        job.gpu_ids = gpu_ids
+        job.started_at = _utc_now()
+        job.started_mono = time.monotonic()
+        self._running_jobs[job.job_id] = job
+        for gpu_id in gpu_ids:
+            self._gpu_jobs.setdefault(gpu_id, []).append(job)
+        job.task = asyncio.create_task(
+            self._execute(job), name=f"gpuq-run-{job.job_id}"
+        )
+
+    def _observe_gpus(
+        self, occupancy: dict[int, list[int]]
+    ) -> dict[int, dict[str, Any]]:
         observation: dict[int, dict[str, Any]] = {}
         for gpu_id in self._gpu_ids:
-            running = self._running.get(gpu_id)
-            if running is not None:
-                observation[gpu_id] = {
-                    "state": "running",
-                    "job_id": running.job_id,
-                    "owner": running.spec.owner,
-                    "label": running.spec.label,
+            jobs = self._gpu_jobs.get(gpu_id, [])
+            if jobs:
+                mode = jobs[0].spec.mode
+                value: dict[str, Any] = {
+                    "state": mode,
+                    "jobs": [self._job_brief(job) for job in jobs],
                 }
+                if mode == "shared":
+                    value.update(
+                        {
+                            "shared_used": len(jobs),
+                            "shared_capacity": self._shared_capacity,
+                        }
+                    )
+                observation[gpu_id] = value
                 continue
 
             pids = occupancy.get(gpu_id, [])
@@ -297,34 +415,13 @@ class GpuBroker:
             card_lock = try_card_lock(gpu_id, self._lock_dir)
             if card_lock is None:
                 observation[gpu_id] = {"state": "locked"}
-                continue
-
-            if not self._queue:
+            else:
                 card_lock.release()
                 observation[gpu_id] = {"state": "idle"}
-                continue
-
-            job = self._queue.popleft()
-            job.state = "running"
-            job.gpu_id = gpu_id
-            job.started_at = _utc_now()
-            job.started_mono = time.monotonic()
-            job.card_lock = card_lock
-            self._running[gpu_id] = job
-            observation[gpu_id] = {
-                "state": "running",
-                "job_id": job.job_id,
-                "owner": job.spec.owner,
-                "label": job.spec.label,
-            }
-            job.task = asyncio.create_task(
-                self._execute(job), name=f"gpuq-run-{job.job_id}"
-            )
-
-        self._gpu_observation = observation
+        return observation
 
     async def _execute(self, job: Job) -> None:
-        assert job.gpu_id is not None
+        assert job.gpu_ids
         output_tasks: list[asyncio.Task[None]] = []
         state = "failed"
         exit_code = 1
@@ -333,7 +430,7 @@ class GpuBroker:
             environment = {
                 **os.environ,
                 **job.spec.env,
-                "CUDA_VISIBLE_DEVICES": str(job.gpu_id),
+                "CUDA_VISIBLE_DEVICES": ",".join(map(str, job.gpu_ids)),
             }
             job.process = await asyncio.create_subprocess_exec(
                 *job.spec.argv,
@@ -348,7 +445,10 @@ class GpuBroker:
                 {
                     "type": "started",
                     "job_id": job.job_id,
-                    "gpu_id": job.gpu_id,
+                    "label": job.spec.label,
+                    "mode": job.spec.mode,
+                    "gpu_count": job.spec.gpu_count,
+                    "gpu_ids": list(job.gpu_ids),
                     "run_timeout_s": job.spec.run_timeout_s,
                 },
             )
@@ -382,12 +482,29 @@ class GpuBroker:
                 await self._terminate(job.process)
             await asyncio.gather(*output_tasks, return_exceptions=True)
         finally:
-            if job.card_lock is not None:
-                job.card_lock.release()
-                job.card_lock = None
-            self._running.pop(job.gpu_id, None)
+            self._release_allocation(job)
             self._finish(job, state=state, exit_code=exit_code, reason=reason)
             self._wakeup.set()
+
+    def _release_allocation(self, job: Job) -> None:
+        self._running_jobs.pop(job.job_id, None)
+        for gpu_id in job.gpu_ids:
+            jobs = self._gpu_jobs.get(gpu_id, [])
+            if job in jobs:
+                jobs.remove(job)
+            if jobs:
+                self._gpu_observation[gpu_id] = {
+                    "state": "shared",
+                    "jobs": [self._job_brief(item) for item in jobs],
+                    "shared_used": len(jobs),
+                    "shared_capacity": self._shared_capacity,
+                }
+                continue
+            self._gpu_jobs.pop(gpu_id, None)
+            card_lock = self._gpu_locks.pop(gpu_id, None)
+            if card_lock is not None:
+                card_lock.release()
+            self._gpu_observation[gpu_id] = {"state": "unknown"}
 
     async def _pump(
         self,
@@ -443,7 +560,9 @@ class GpuBroker:
             "state": state,
             "exit_code": exit_code,
             "reason": reason,
-            "gpu_id": job.gpu_id,
+            "gpu_ids": list(job.gpu_ids),
+            "gpu_count": job.spec.gpu_count,
+            "mode": job.spec.mode,
             "owner": job.spec.owner,
             "label": job.spec.label,
             "submitted_at": job.submitted_at,
@@ -460,22 +579,78 @@ class GpuBroker:
         self._write_status()
 
     def _queue_eta(self, now: float) -> dict[str, float | None]:
-        slots: list[float] = []
-        for gpu_id in self._gpu_ids:
-            running = self._running.get(gpu_id)
-            if running is not None and running.started_mono is not None:
-                elapsed = now - running.started_mono
-                slots.append(max(0.0, running.spec.estimate_s - elapsed))
-            elif self._gpu_observation.get(gpu_id, {}).get("state") == "idle":
-                slots.append(0.0)
-        if not slots:
+        available_ids = [
+            gpu_id
+            for gpu_id in self._gpu_ids
+            if gpu_id in self._gpu_jobs
+            or self._gpu_observation.get(gpu_id, {}).get("state") == "idle"
+        ]
+        if not available_ids:
             return {job.job_id: None for job in self._queue}
+
+        virtual: dict[int, dict[str, Any]] = {
+            gpu_id: {"exclusive_until": 0.0, "shared_ends": []}
+            for gpu_id in available_ids
+        }
+        for job in self._running_jobs.values():
+            if job.started_mono is None:
+                continue
+            remaining = max(0.0, job.spec.estimate_s - (now - job.started_mono))
+            for gpu_id in job.gpu_ids:
+                if gpu_id not in virtual:
+                    continue
+                if job.spec.mode == "exclusive":
+                    virtual[gpu_id]["exclusive_until"] = max(
+                        virtual[gpu_id]["exclusive_until"], remaining
+                    )
+                else:
+                    virtual[gpu_id]["shared_ends"].append(remaining)
+
         result: dict[str, float | None] = {}
-        for job in self._queue:
-            slot_index = min(range(len(slots)), key=slots.__getitem__)
-            result[job.job_id] = slots[slot_index]
-            slots[slot_index] += job.spec.estimate_s
+        queue = list(self._queue)
+        for index, job in enumerate(queue):
+            if job.spec.gpu_count > len(virtual):
+                for blocked in queue[index:]:
+                    result[blocked.job_id] = None
+                break
+            if job.spec.mode == "exclusive":
+                ready = sorted(
+                    (
+                        max(
+                            state["exclusive_until"],
+                            max(state["shared_ends"], default=0.0),
+                        ),
+                        gpu_id,
+                    )
+                    for gpu_id, state in virtual.items()
+                )
+                selected = ready[: job.spec.gpu_count]
+                start = max(item[0] for item in selected)
+                for _, gpu_id in selected:
+                    virtual[gpu_id]["exclusive_until"] = start + job.spec.estimate_s
+                    virtual[gpu_id]["shared_ends"] = []
+            else:
+                ready = sorted(
+                    (self._shared_ready_time(state), gpu_id)
+                    for gpu_id, state in virtual.items()
+                )
+                selected = ready[: job.spec.gpu_count]
+                start = max(item[0] for item in selected)
+                for _, gpu_id in selected:
+                    state = virtual[gpu_id]
+                    state["shared_ends"] = [
+                        end for end in state["shared_ends"] if end > start
+                    ]
+                    state["shared_ends"].append(start + job.spec.estimate_s)
+            result[job.job_id] = start
         return result
+
+    def _shared_ready_time(self, state: dict[str, Any]) -> float:
+        start = float(state["exclusive_until"])
+        active = sorted(end for end in state["shared_ends"] if end > start)
+        if len(active) < self._shared_capacity:
+            return start
+        return active[len(active) - self._shared_capacity]
 
     def _publish_queue(self, *, force: bool) -> None:
         now = time.monotonic()
@@ -492,6 +667,9 @@ class GpuBroker:
                     {
                         "type": "queued",
                         "job_id": job.job_id,
+                        "label": job.spec.label,
+                        "mode": job.spec.mode,
+                        "gpu_count": job.spec.gpu_count,
                         "position": position,
                         "queue_length": total,
                         "eta_seconds": eta_s,
@@ -508,11 +686,22 @@ class GpuBroker:
             "state": job.state,
             "owner": job.spec.owner,
             "label": job.spec.label,
-            "gpu_id": job.gpu_id,
+            "mode": job.spec.mode,
+            "gpu_count": job.spec.gpu_count,
+            "gpu_ids": list(job.gpu_ids),
             "submitted_at": job.submitted_at,
             "started_at": job.started_at,
             "wait_seconds": max(0.0, now - job.submitted_mono),
             "estimate_seconds": job.spec.estimate_s,
+        }
+
+    @staticmethod
+    def _job_brief(job: Job) -> dict[str, Any]:
+        return {
+            "job_id": job.job_id,
+            "owner": job.spec.owner,
+            "label": job.spec.label,
+            "mode": job.spec.mode,
         }
 
     def _emit(self, job: Job, event: dict[str, Any]) -> None:
@@ -527,7 +716,9 @@ class GpuBroker:
             "job_id": job.job_id,
             "owner": job.spec.owner,
             "label": job.spec.label,
-            "gpu_id": job.gpu_id,
+            "mode": job.spec.mode,
+            "gpu_count": job.spec.gpu_count,
+            "gpu_ids": list(job.gpu_ids),
         }
         if result is not None:
             value.update(

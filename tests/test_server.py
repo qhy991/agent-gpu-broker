@@ -59,6 +59,8 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
                 "cwd": str(Path.cwd()),
                 "owner": "agent-a",
                 "label": "holder",
+                "mode": "exclusive",
+                "gpu_count": 1,
                 "estimate_s": 0.15,
                 "run_timeout_s": 2,
             },
@@ -77,6 +79,8 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
                 "cwd": str(Path.cwd()),
                 "owner": "agent-b",
                 "label": "waiting",
+                "mode": "exclusive",
+                "gpu_count": 1,
                 "estimate_s": 0.1,
                 "run_timeout_s": 2,
             },
@@ -105,6 +109,23 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         second_writer.close()
         await first_writer.wait_closed()
         await second_writer.wait_closed()
+
+    async def test_resource_fields_are_required(self):
+        reader, writer = await asyncio.open_unix_connection(self.socket_path)
+        await send(
+            writer,
+            {
+                "op": "run",
+                "argv": [sys.executable, "-c", "print(1)"],
+                "cwd": str(Path.cwd()),
+                "owner": "agent-a",
+                "label": "missing-resource-shape",
+            },
+        )
+        event = await receive(reader)
+        self.assertEqual(event["type"], "error")
+        writer.close()
+        await writer.wait_closed()
 
 
 if __name__ == "__main__":

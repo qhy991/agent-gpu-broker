@@ -36,6 +36,16 @@ def parse_duration(value: str) -> float:
     return result
 
 
+def positive_int(value: str) -> int:
+    try:
+        result = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"invalid integer: {value}") from exc
+    if result < 1:
+        raise argparse.ArgumentTypeError("value must be positive")
+    return result
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="gpuq")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -45,6 +55,7 @@ def _parser() -> argparse.ArgumentParser:
     serve.add_argument("--state-dir", type=Path, default=DEFAULT_STATE_DIR)
     serve.add_argument("--lock-dir", type=Path, default=DEFAULT_LOCK_DIR)
     serve.add_argument("--gpus", help="comma-separated physical GPU indices")
+    serve.add_argument("--shared-capacity", type=positive_int, default=2)
     serve.add_argument("--poll-interval", type=parse_duration, default=2.0)
     serve.add_argument("--heartbeat", type=parse_duration, default=30.0)
 
@@ -58,7 +69,9 @@ def _parser() -> argparse.ArgumentParser:
 
     run = subparsers.add_parser("run", help="queue and run one GPU command")
     run.add_argument("--socket", type=Path, default=DEFAULT_SOCKET)
-    run.add_argument("--label")
+    run.add_argument("--label", required=True, help="human-readable job name")
+    run.add_argument("--mode", choices=("shared", "exclusive"), required=True)
+    run.add_argument("--gpu-count", type=positive_int, required=True)
     run.add_argument("--owner", default=getpass.getuser())
     run.add_argument("--cwd", type=Path, default=Path.cwd())
     run.add_argument("--estimate", type=parse_duration, default=600.0)
@@ -102,6 +115,7 @@ async def _serve(args: argparse.Namespace) -> int:
         state_dir=args.state_dir.expanduser(),
         lock_dir=args.lock_dir,
         gpu_ids=gpu_ids,
+        shared_capacity=args.shared_capacity,
         poll_interval_s=args.poll_interval,
         heartbeat_s=args.heartbeat,
     )
@@ -151,7 +165,12 @@ def _status(args: argparse.Namespace) -> int:
         print(f"probe error: {snapshot['probe_error']}")
     print("GPUS")
     for gpu in snapshot["gpus"]:
-        detail = gpu.get("label") or gpu.get("job_id") or ""
+        jobs = gpu.get("jobs", [])
+        detail = ",".join(job["label"] for job in jobs)
+        if gpu.get("state") == "shared":
+            detail = (
+                f"{gpu['shared_used']}/{gpu['shared_capacity']} " + detail
+            ).rstrip()
         if gpu.get("pids"):
             detail = f"pids={','.join(map(str, gpu['pids']))}"
         print(f"  {gpu['gpu_id']}: {gpu['state']} {detail}".rstrip())
@@ -160,8 +179,8 @@ def _status(args: argparse.Namespace) -> int:
         print("  -")
     for job in snapshot["running"]:
         print(
-            f"  {job['job_id']} gpu={job['gpu_id']} owner={job['owner']} "
-            f"label={job['label']}"
+            f"  {job['job_id']} gpus={','.join(map(str, job['gpu_ids']))} "
+            f"mode={job['mode']} owner={job['owner']} label={job['label']}"
         )
     print("QUEUE")
     if not snapshot["queue"]:
@@ -170,7 +189,8 @@ def _status(args: argparse.Namespace) -> int:
         eta = _format_eta(job.get("eta_seconds"))
         print(
             f"  {job['position']}. {job['job_id']} owner={job['owner']} "
-            f"label={job['label']} eta={eta}"
+            f"label={job['label']} mode={job['mode']} gpus={job['gpu_count']} "
+            f"eta={eta}"
         )
     return 0
 
@@ -219,7 +239,9 @@ def _run(args: argparse.Namespace) -> int:
                 "argv": command,
                 "cwd": str(args.cwd.expanduser().resolve()),
                 "owner": args.owner,
-                "label": args.label or Path(command[0]).name,
+                "label": args.label,
+                "mode": args.mode,
+                "gpu_count": args.gpu_count,
                 "estimate_s": args.estimate,
                 "queue_timeout_s": args.queue_timeout,
                 "run_timeout_s": args.run_timeout,
@@ -237,7 +259,10 @@ def _run(args: argparse.Namespace) -> int:
                 event = json.loads(line)
                 kind = event.get("type")
                 if kind == "accepted":
-                    _note(f"accepted job {event['job_id']}")
+                    _note(
+                        f"accepted job {event['job_id']} label={event['label']} "
+                        f"mode={event['mode']} gpus={event['gpu_count']}"
+                    )
                 elif kind == "queued":
                     message = (
                         f"queued position={event['position']}/{event['queue_length']} "
@@ -248,7 +273,8 @@ def _run(args: argparse.Namespace) -> int:
                     _note(message)
                 elif kind == "started":
                     _note(
-                        f"running on physical GPU {event['gpu_id']} "
+                        "running on physical GPUs "
+                        f"{','.join(map(str, event['gpu_ids']))} "
                         f"(run limit {_format_eta(event['run_timeout_s'])})"
                     )
                 elif kind == "output":

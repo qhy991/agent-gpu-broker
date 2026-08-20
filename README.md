@@ -4,17 +4,19 @@
 keep a normal `gpu-run` command open while the broker streams queue position,
 advisory ETA, allocation, output, and completion back through the same call.
 
-The broker is deliberately single-host and exclusive-only. It shares KDA's
-default `/tmp/kda-gpu-locks` lock domain, so KDA judge jobs, KDA agent jobs, and
-`gpu-run` jobs from this project do not intentionally co-tenant a card.
+The broker is deliberately single-host. Each job requests `shared` correctness
+capacity or `exclusive` clean-card capacity and one or more GPUs. It shares
+KDA's default `/tmp/kda-gpu-locks` lock domain, so KDA work never intentionally
+co-tenants a broker-managed card.
 
 ## Architecture
 
 ```text
 Agent A ─┐
-Agent B ─┼─ gpu-run ─ Unix socket ─ gpuq broker ─ one clean locked GPU/job
-Agent C ─┘                         │
-                                  └─ shared status, logs, results
+Agent B ─┼─ gpu-run ─ Unix socket ─ gpuq broker ─ atomic GPU allocation
+Agent C ─┘                         │                 ├─ shared (bounded/card)
+                                  │                 └─ exclusive (clean)
+                                  └─ status, logs, results
 ```
 
 The daemon owns all mutable scheduling state. The shared state directory is a
@@ -47,7 +49,8 @@ python3 -m venv .venv
 bin/gpuq serve \
   --socket /tmp/agent-gpu-broker.sock \
   --state-dir ~/.local/share/agent-gpu-broker \
-  --lock-dir /tmp/kda-gpu-locks
+  --lock-dir /tmp/kda-gpu-locks \
+  --shared-capacity 2
 ```
 
 Use `--gpus 1,2` to constrain an experiment to selected physical cards. Without
@@ -73,25 +76,40 @@ bin/gpuq status
 
 bin/gpu-run \
   --label ncu-attention \
+  --mode exclusive \
+  --gpu-count 1 \
   --queue-timeout 2h \
   --run-timeout 20m \
   --estimate 10m \
   -- ncu --set full python profile.py
+
+bin/gpu-run \
+  --label distributed-correctness \
+  --mode shared \
+  --gpu-count 2 \
+  --run-timeout 10m \
+  -- torchrun --nproc-per-node=2 test.py
 ```
 
 `--timeout` is a compatibility alias for `--run-timeout`. Durations accept `s`,
-`m`, or `h`. Queue position is exact FIFO order. ETA is advisory and is computed
-from each job's declared estimate and the estimated remaining duration of running
-broker jobs; it is unknown while every usable GPU is occupied externally.
+`m`, or `h`. `--label`, `--mode`, and `--gpu-count` are required. Multi-GPU
+allocation is atomic. Queue position is exact FIFO order; a blocked head job is
+not bypassed. ETA is advisory and accounts for declared estimates, requested GPU
+counts, shared slots, and running broker jobs; externally occupied GPUs have an
+unknown release time.
 
 Status messages are emitted when position/ETA changes and as a periodic heartbeat:
 
 ```text
-[gpu-run] accepted job gpuq-4a2e9b6f3c1d
+[gpu-run] accepted job gpuq-4a2e9b6f3c1d label=ncu-attention mode=exclusive gpus=1
 [gpu-run] queued position=3/5 eta~9m30s
 [gpu-run] queued position=2/4 eta~4m10s
-[gpu-run] running on physical GPU 1 (run limit 20m)
+[gpu-run] running on physical GPUs 1 (run limit 20m)
 ```
+
+`shared` means cooperative best-effort sharing; it does not impose memory quotas
+or isolate failures. Use `exclusive` for benchmarks, NCU, and latency-sensitive
+measurements.
 
 ## Trust boundary
 
