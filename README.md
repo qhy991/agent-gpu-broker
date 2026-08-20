@@ -1,5 +1,7 @@
 # Agent GPU Broker
 
+[简体中文](README.zh-CN.md) | English
+
 `agent-gpu-broker` is a small, machine-wide GPU queue for coding agents. Agents
 keep a normal `gpu-run` command open while the broker streams queue position,
 advisory ETA, allocation, output, and completion back through the same call.
