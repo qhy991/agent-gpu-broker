@@ -1,4 +1,4 @@
-"""NVIDIA GPU discovery, occupancy probes, and KDA-compatible card locks."""
+"""NVIDIA GPU discovery, occupancy probes, and scheduler-compatible locks."""
 
 from __future__ import annotations
 
@@ -82,7 +82,7 @@ class CardLock:
 
 
 def try_card_lock(gpu_id: int, lock_dir: Path) -> CardLock | None:
-    """Take the same advisory per-card lock used by KDA."""
+    """Take an advisory per-card lock shared with cooperating schedulers."""
     lock_dir.mkdir(parents=True, exist_ok=True)
     path = lock_dir / f"gpu-{gpu_id}.lock"
     fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o644)

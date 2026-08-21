@@ -31,9 +31,9 @@ The daemon owns one machine-wide `shared_capacity` limit per GPU (default: 2).
 2. An exclusive allocation never overlaps another broker job on its GPUs.
 3. A shared allocation overlaps only shared broker jobs and never exceeds the
    configured per-GPU shared capacity.
-4. The broker holds the same per-card `flock` used by KDA while any broker job
-   uses that card; a card with a foreign compute process or lock is not newly
-   assigned.
+4. The broker holds a per-card `flock` while any broker job uses that card. Other
+   cooperating schedulers can use the same lock directory; a card with a foreign
+   compute process or lock is not newly assigned.
 5. Jobs start in strict FIFO order. A blocked head job intentionally blocks jobs
    behind it.
 6. Waiting time and running time use separate limits.

@@ -1,0 +1,22 @@
+[Unit]
+Description=Agent-friendly GPU queue broker
+After=local-fs.target
+
+[Service]
+Type=simple
+User=gpuq
+Group=gpuq-users
+WorkingDirectory=/opt/agent-gpu-broker
+ExecStart=/opt/agent-gpu-broker/.venv/bin/gpuq serve --socket /tmp/agent-gpu-broker.sock --state-dir /var/lib/agent-gpu-broker --lock-dir /run/agent-gpu-broker/locks --shared-capacity 2
+RuntimeDirectory=agent-gpu-broker
+RuntimeDirectoryMode=0770
+StateDirectory=agent-gpu-broker
+StateDirectoryMode=0770
+Restart=on-failure
+RestartSec=2
+UMask=0007
+NoNewPrivileges=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target

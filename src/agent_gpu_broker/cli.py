@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import getpass
 import json
+import os
 import signal
 import socket
 import sys
@@ -17,7 +18,7 @@ from .server import BrokerServer
 
 DEFAULT_SOCKET = Path("/tmp/agent-gpu-broker.sock")
 DEFAULT_STATE_DIR = Path.home() / ".local/share/agent-gpu-broker"
-DEFAULT_LOCK_DIR = Path("/tmp/kda-gpu-locks")
+DEFAULT_LOCK_DIR = Path(os.environ.get("GPUQ_LOCK_DIR", "/tmp/agent-gpu-locks"))
 
 
 def parse_duration(value: str) -> float:

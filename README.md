@@ -7,9 +7,8 @@ keep a normal `gpu-run` command open while the broker streams queue position,
 advisory ETA, allocation, output, and completion back through the same call.
 
 The broker is deliberately single-host. Each job requests `shared` correctness
-capacity or `exclusive` clean-card capacity and one or more GPUs. It shares
-KDA's default `/tmp/kda-gpu-locks` lock domain, so KDA work never intentionally
-co-tenants a broker-managed card.
+capacity or `exclusive` clean-card capacity and one or more GPUs. Cooperating
+local schedulers can use its per-card lock directory to avoid co-tenancy.
 
 ## Architecture
 
@@ -51,7 +50,7 @@ python3 -m venv .venv
 bin/gpuq serve \
   --socket /tmp/agent-gpu-broker.sock \
   --state-dir ~/.local/share/agent-gpu-broker \
-  --lock-dir /tmp/kda-gpu-locks \
+  --lock-dir /tmp/agent-gpu-locks \
   --shared-capacity 2
 ```
 
@@ -59,7 +58,8 @@ Use `--gpus 1,2` to constrain an experiment to selected physical cards. Without
 it, the broker discovers every NVIDIA GPU and still skips cards that are occupied
 or locked by another process.
 
-On `verda-b200x4`, install the checked-in user service with:
+For a single Unix account with the repository at `~/agent-gpu-broker`, install
+the checked-in user service with:
 
 ```bash
 install -Dm644 deploy/gpu-agent-broker.service \
@@ -68,8 +68,11 @@ systemctl --user daemon-reload
 systemctl --user enable --now gpu-agent-broker.service
 ```
 
-The account currently has systemd user services but not login lingering, so the
-service starts with the user's login session rather than before login.
+User services normally follow that user's login lifecycle. A root administrator
+deploying this for a trusted team should instead follow the
+[root-managed deployment guide](docs/root-deployment.md), which uses a dedicated
+unprivileged service account and a system service. A ready-to-copy generic Agent
+policy is available in [docs/AGENTS.example.md](docs/AGENTS.example.md).
 
 ## Agent commands
 

@@ -11,8 +11,7 @@
 - `shared`：允许与其他正确性检查等非延迟敏感任务共享 GPU；
 - `exclusive`：要求干净、独占的 GPU，适合性能测试和 NCU profiling。
 
-broker 与 KDA 默认共用 `/tmp/kda-gpu-locks` 锁域，因此 KDA 任务不会主动与
-broker 管理的任务混用同一张卡。
+其他本机调度器可以与 broker 使用同一个逐卡锁目录，从而避免主动混用同一张卡。
 
 ## 架构
 
@@ -52,14 +51,15 @@ python3 -m venv .venv
 bin/gpuq serve \
   --socket /tmp/agent-gpu-broker.sock \
   --state-dir ~/.local/share/agent-gpu-broker \
-  --lock-dir /tmp/kda-gpu-locks \
+  --lock-dir /tmp/agent-gpu-locks \
   --shared-capacity 2
 ```
 
 默认自动扫描机器上的全部 NVIDIA GPU，并跳过存在外部计算进程或外部锁的卡。
 可以通过 `--gpus 1,2` 将 broker 限制在指定的物理 GPU 上。
 
-在 `verda-b200x4` 上可以安装仓库内的 systemd 用户服务：
+如果由单个 Unix 账号使用，并将仓库放在 `~/agent-gpu-broker`，可以安装仓库内的
+systemd 用户服务：
 
 ```bash
 install -Dm644 deploy/gpu-agent-broker.service \
@@ -67,6 +67,10 @@ install -Dm644 deploy/gpu-agent-broker.service \
 systemctl --user daemon-reload
 systemctl --user enable --now gpu-agent-broker.service
 ```
+
+如果由 root 为可信团队统一部署，应使用无特权的专用服务账号和系统级 service，
+具体步骤见 [root 管理部署指南](docs/root-deployment.zh-CN.md)。可直接复制到项目中的
+通用 Agent 规则见 [docs/AGENTS.example.md](docs/AGENTS.example.md)。
 
 ## Agent 使用方式
 
