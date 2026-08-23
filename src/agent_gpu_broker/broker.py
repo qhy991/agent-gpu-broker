@@ -19,6 +19,55 @@ from .gpu import CardLock, GpuInventory, NvidiaSmiInventory, try_card_lock
 
 MODES = frozenset({"shared", "exclusive"})
 
+BROKER_VERSION = "0.4.0"
+
+# Jobs that exit this fast with a permission error in their stderr almost
+# always lost a race between admission and the workload's first file access
+# (unreadable cwd, 0600 release artifact, ACL-restricted run root). The exit
+# status itself stays authoritative; this only attaches a diagnostic.
+_SWALLOWED_FAILURE_WINDOW_S = 2.0
+_SWALLOWED_FAILURE_MARKERS = (b"permission denied", b"eacces")
+
+
+def _instance_id() -> str:
+    host = os.uname().nodename
+    boot = "unknown"
+    try:
+        boot = Path("/proc/self/stat").read_text().split()[21]
+    except (OSError, IndexError):
+        pass
+    return f"{host}-pid{os.getpid()}-start{boot}"
+
+
+def _preflight_error(spec: "JobSpec") -> str | None:
+    """Return a human reason when the broker identity cannot launch the argv.
+
+    Runs as the broker's own (unprivileged) user, so os.access here reflects
+    exactly what create_subprocess_exec would hit. Checking before spawn turns
+    an instant crash like a 0600 artifact or a 0700 run root into a named
+    preflight failure instead of a confusing exit-1 (or worse, a swallowed
+    exit-0 from a wrapper script).
+    """
+    executable = spec.argv[0]
+    if "/" not in executable and not _resolve_on_path(executable):
+        return f"preflight: executable not found on PATH: {executable}"
+    if not os.access(executable if "/" in executable else _resolve_on_path(executable) or "", os.X_OK):
+        return f"preflight: executable not accessible: {executable}"
+    cwd = Path(spec.cwd)
+    real_cwd = cwd.resolve()
+    if not os.access(real_cwd, os.R_OK | os.X_OK):
+        return f"preflight: cwd not accessible to broker identity: {cwd}"
+    return None
+
+
+def _resolve_on_path(executable: str) -> str | None:
+    search = os.environ.get("PATH", os.defpath).split(os.pathsep)
+    for directory in search:
+        candidate = Path(directory) / executable
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    return None
+
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -50,6 +99,7 @@ class Job:
     started_at: str | None = None
     started_mono: float | None = None
     process: asyncio.subprocess.Process | None = None
+    stderr_tail: bytearray = field(default_factory=bytearray)
     task: asyncio.Task[None] | None = None
     last_queue_key: tuple[Any, ...] | None = None
     last_notice_mono: float = 0.0
@@ -148,6 +198,7 @@ class GpuBroker:
         self._recent: deque[dict[str, Any]] = deque(maxlen=20)
         self._gpu_observation: dict[int, dict[str, Any]] = {}
         self._probe_error: str | None = None
+        self._instance_id = _instance_id()
         self._wakeup = asyncio.Event()
         self._scheduler: asyncio.Task[None] | None = None
         self._closed = False
@@ -256,6 +307,8 @@ class GpuBroker:
         )
         return {
             "version": 2,
+            "broker_version": BROKER_VERSION,
+            "instance_id": self._instance_id,
             "updated_at": _utc_now(),
             "probe_error": self._probe_error,
             "shared_capacity": self._shared_capacity,
@@ -426,6 +479,12 @@ class GpuBroker:
         state = "failed"
         exit_code = 1
         reason: str | None = None
+        preflight = _preflight_error(job.spec)
+        if preflight is not None:
+            self._record_lifecycle(job, "preflight_rejected")
+            self._finish(job, state="failed", exit_code=127, reason=preflight)
+            self._wakeup.set()
+            return
         try:
             environment = {
                 **os.environ,
@@ -516,6 +575,9 @@ class GpuBroker:
             data = await stream.read(65536)
             if not data:
                 return
+            if stream_name == "stderr":
+                job.stderr_tail += data
+                del job.stderr_tail[:-8192]
             self._store.append_output(job.job_id, stream_name, data)
             self._emit(
                 job,
@@ -544,6 +606,31 @@ class GpuBroker:
             pass
         await process.wait()
 
+    def _swallowed_failure_warning(
+        self, job: Job, duration_s: float | None
+    ) -> str | None:
+        if duration_s is None or duration_s > _SWALLOWED_FAILURE_WINDOW_S:
+            return None
+        lowered = bytes(job.stderr_tail).lower()
+        if not any(marker in lowered for marker in _SWALLOWED_FAILURE_MARKERS):
+            return None
+        first_line = next(
+            (
+                line
+                for line in bytes(job.stderr_tail).decode("utf-8", "replace").splitlines()
+                if any(
+                    marker in line.lower().encode() for marker in _SWALLOWED_FAILURE_MARKERS
+                )
+            ),
+            "",
+        ).strip()
+        return (
+            "possible_swallowed_failure: job exited within "
+            f"{_SWALLOWED_FAILURE_WINDOW_S:g}s and stderr mentions a permission "
+            f"error; wrapper scripts may have converted it to this exit code. "
+            f"First matching stderr line: {first_line!r}"
+        )
+
     def _finish(
         self, job: Job, *, state: str, exit_code: int, reason: str | None
     ) -> None:
@@ -570,6 +657,9 @@ class GpuBroker:
             "completed_at": completed_at,
             "duration_seconds": duration_s,
         }
+        warning = self._swallowed_failure_warning(job, duration_s)
+        if warning is not None:
+            result["warning"] = warning
         job.state = state
         self._store.record_result(job.job_id, result)
         self._emit(job, {"type": "finished", **result})
