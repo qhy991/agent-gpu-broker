@@ -8,7 +8,13 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from agent_gpu_broker.cli import _run, _status, parse_duration, positive_int
+from agent_gpu_broker.cli import (
+    _run,
+    _status,
+    parse_duration,
+    parse_estimate,
+    positive_int,
+)
 
 
 class ContextResource:
@@ -58,6 +64,10 @@ class DurationTests(unittest.TestCase):
         self.assertEqual(positive_int("2"), 2)
         with self.assertRaises(argparse.ArgumentTypeError):
             positive_int("0")
+
+    def test_unknown_estimate(self):
+        self.assertIsNone(parse_estimate("unknown"))
+        self.assertEqual(parse_estimate("2m"), 120)
 
 
 class RunTests(unittest.TestCase):
@@ -127,7 +137,7 @@ class RunTests(unittest.TestCase):
 class StatusTests(unittest.TestCase):
     def test_human_status_shows_broker_identity(self):
         snapshot = {
-            "broker_version": "0.4.1",
+            "broker_version": "0.5.0",
             "instance_id": "host-pid1-start1",
             "probe_error": None,
             "gpus": [{"gpu_id": 0, "state": "idle"}],
@@ -148,7 +158,7 @@ class StatusTests(unittest.TestCase):
         ):
             with contextlib.redirect_stdout(stdout):
                 self.assertEqual(_status(args), 0)
-        self.assertIn("version=0.4.1", stdout.getvalue())
+        self.assertIn("version=0.5.0", stdout.getvalue())
         self.assertIn("instance=host-pid1-start1", stdout.getvalue())
 
 

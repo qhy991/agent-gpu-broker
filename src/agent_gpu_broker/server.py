@@ -160,6 +160,7 @@ class BrokerServer:
         ):
             raise ValueError("gpu_count must be a positive integer")
         queue_timeout = request.get("queue_timeout_s")
+        raw_estimate = request.get("estimate_s", 600.0)
         return JobSpec(
             argv=tuple(argv),
             cwd=str(request["cwd"]),
@@ -167,7 +168,11 @@ class BrokerServer:
             label=label.strip(),
             mode=mode,
             gpu_count=gpu_count,
-            estimate_s=max(1.0, float(request.get("estimate_s", 600.0))),
+            estimate_s=(
+                None
+                if raw_estimate is None
+                else max(1.0, float(raw_estimate))
+            ),
             run_timeout_s=max(1.0, float(request.get("run_timeout_s", 900.0))),
             queue_timeout_s=(
                 None if queue_timeout is None else max(0.01, float(queue_timeout))

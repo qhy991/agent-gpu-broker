@@ -37,6 +37,12 @@ def parse_duration(value: str) -> float:
     return result
 
 
+def parse_estimate(value: str) -> float | None:
+    if value.strip().lower() == "unknown":
+        return None
+    return parse_duration(value)
+
+
 def positive_int(value: str) -> int:
     try:
         result = int(value)
@@ -75,7 +81,7 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--gpu-count", type=positive_int, required=True)
     run.add_argument("--owner", default=getpass.getuser())
     run.add_argument("--cwd", type=Path, default=Path.cwd())
-    run.add_argument("--estimate", type=parse_duration, default=600.0)
+    run.add_argument("--estimate", type=parse_estimate, default=600.0)
     run.add_argument("--queue-timeout", type=parse_duration)
     run.add_argument(
         "--run-timeout",

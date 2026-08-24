@@ -128,6 +128,40 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         writer.close()
         await writer.wait_closed()
 
+    async def test_unknown_estimate_round_trips_as_null(self):
+        reader, writer = await asyncio.open_unix_connection(self.socket_path)
+        await send(
+            writer,
+            {
+                "op": "run",
+                "argv": [sys.executable, "-c", "import time; time.sleep(30)"],
+                "cwd": str(Path.cwd()),
+                "owner": "agent-a",
+                "label": "service",
+                "mode": "exclusive",
+                "gpu_count": 1,
+                "estimate_s": None,
+                "run_timeout_s": 60,
+            },
+        )
+        job_id = None
+        while True:
+            event = await receive(reader)
+            if event["type"] == "accepted":
+                job_id = event["job_id"]
+            if event["type"] == "started":
+                break
+        snapshot = self.broker.snapshot()
+        self.assertIsNone(snapshot["running"][0]["estimate_seconds"])
+        self.assertIsNotNone(job_id)
+        self.assertTrue(
+            await self.broker.cancel(job_id, reason="test cleanup")
+        )
+        while (await receive(reader))["type"] != "finished":
+            pass
+        writer.close()
+        await writer.wait_closed()
+
     async def test_running_disconnect_preserves_cancel_reason_and_releases_gpu(self):
         reader, writer = await asyncio.open_unix_connection(self.socket_path)
         await send(

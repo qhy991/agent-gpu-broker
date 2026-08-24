@@ -93,7 +93,7 @@ class JobSpec:
     label: str
     mode: str
     gpu_count: int
-    estimate_s: float
+    estimate_s: float | None
     run_timeout_s: float
     queue_timeout_s: float | None
     env: dict[str, str] = field(default_factory=dict)
@@ -270,6 +270,8 @@ class GpuBroker:
             raise ValueError(
                 f"gpu_count={spec.gpu_count} exceeds managed GPUs={len(self._gpu_ids)}"
             )
+        if spec.estimate_s is not None and spec.estimate_s <= 0:
+            raise ValueError("estimate_s must be positive or unknown")
         job = Job(
             job_id=f"gpuq-{uuid.uuid4().hex[:12]}",
             spec=spec,
@@ -717,12 +719,16 @@ class GpuBroker:
         for job in self._running_jobs.values():
             if job.started_mono is None:
                 continue
-            remaining = max(0.0, job.spec.estimate_s - (now - job.started_mono))
+            remaining = (
+                None
+                if job.spec.estimate_s is None
+                else max(0.0, job.spec.estimate_s - (now - job.started_mono))
+            )
             for gpu_id in job.gpu_ids:
                 if gpu_id not in virtual:
                     continue
                 if job.spec.mode == "exclusive":
-                    virtual[gpu_id]["exclusive_until"] = max(
+                    virtual[gpu_id]["exclusive_until"] = self._latest_eta(
                         virtual[gpu_id]["exclusive_until"], remaining
                     )
                 else:
@@ -738,40 +744,76 @@ class GpuBroker:
             if job.spec.mode == "exclusive":
                 ready = sorted(
                     (
-                        max(
-                            state["exclusive_until"],
-                            max(state["shared_ends"], default=0.0),
-                        ),
-                        gpu_id,
-                    )
-                    for gpu_id, state in virtual.items()
+                        (self._exclusive_ready_time(state), gpu_id)
+                        for gpu_id, state in virtual.items()
+                    ),
+                    key=self._eta_sort_key,
                 )
                 selected = ready[: job.spec.gpu_count]
-                start = max(item[0] for item in selected)
+                start = self._latest_eta(*(item[0] for item in selected))
                 for _, gpu_id in selected:
-                    virtual[gpu_id]["exclusive_until"] = start + job.spec.estimate_s
+                    virtual[gpu_id]["exclusive_until"] = self._eta_end(
+                        start, job.spec.estimate_s
+                    )
                     virtual[gpu_id]["shared_ends"] = []
             else:
                 ready = sorted(
-                    (self._shared_ready_time(state), gpu_id)
-                    for gpu_id, state in virtual.items()
+                    (
+                        (self._shared_ready_time(state), gpu_id)
+                        for gpu_id, state in virtual.items()
+                    ),
+                    key=self._eta_sort_key,
                 )
                 selected = ready[: job.spec.gpu_count]
-                start = max(item[0] for item in selected)
+                start = self._latest_eta(*(item[0] for item in selected))
                 for _, gpu_id in selected:
                     state = virtual[gpu_id]
-                    state["shared_ends"] = [
-                        end for end in state["shared_ends"] if end > start
-                    ]
-                    state["shared_ends"].append(start + job.spec.estimate_s)
+                    if start is not None:
+                        state["shared_ends"] = [
+                            end
+                            for end in state["shared_ends"]
+                            if end is None or end > start
+                        ]
+                    state["shared_ends"].append(
+                        self._eta_end(start, job.spec.estimate_s)
+                    )
             result[job.job_id] = start
         return result
 
-    def _shared_ready_time(self, state: dict[str, Any]) -> float:
-        start = float(state["exclusive_until"])
-        active = sorted(end for end in state["shared_ends"] if end > start)
+    @staticmethod
+    def _latest_eta(*values: float | None) -> float | None:
+        if any(value is None for value in values):
+            return None
+        return max((float(value) for value in values), default=0.0)
+
+    @staticmethod
+    def _eta_end(start: float | None, estimate: float | None) -> float | None:
+        if start is None or estimate is None:
+            return None
+        return start + estimate
+
+    @staticmethod
+    def _eta_sort_key(item: tuple[float | None, int]) -> tuple[bool, float, int]:
+        eta, gpu_id = item
+        return eta is None, 0.0 if eta is None else eta, gpu_id
+
+    def _exclusive_ready_time(self, state: dict[str, Any]) -> float | None:
+        return self._latest_eta(
+            state["exclusive_until"], *state["shared_ends"]
+        )
+
+    def _shared_ready_time(self, state: dict[str, Any]) -> float | None:
+        start = state["exclusive_until"]
+        if start is None:
+            return None
+        active = [
+            end
+            for end in state["shared_ends"]
+            if end is None or end > start
+        ]
         if len(active) < self._shared_capacity:
             return start
+        active.sort(key=lambda end: (end is None, 0.0 if end is None else end))
         return active[len(active) - self._shared_capacity]
 
     def _publish_queue(self, *, force: bool) -> None:

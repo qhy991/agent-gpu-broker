@@ -107,6 +107,11 @@ not bypassed. ETA is advisory and accounts for declared estimates, requested GPU
 counts, shared slots, and running broker jobs; externally occupied GPUs have an
 unknown release time.
 
+Long-lived services whose stop time is not known should use
+`--estimate unknown`. Their own start ETA can still be known, while jobs whose
+start depends on that service report `eta=unknown` instead of a fabricated
+multi-month duration.
+
 Before a request enters the FIFO, the daemon checks that its own unprivileged
 identity can enter the working directory and execute the command. Rejected
 requests return exit 127 without reserving a GPU. Ctrl-C sends an explicit

@@ -27,7 +27,7 @@ def spec(
     label: str,
     mode: str = "exclusive",
     gpu_count: int = 1,
-    estimate_s: float = 0.2,
+    estimate_s: float | None = 0.2,
     run_timeout_s: float = 2.0,
     queue_timeout_s: float | None = None,
 ) -> JobSpec:
@@ -146,6 +146,43 @@ class BrokerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(snapshot["queue"][0]["position"], 1)
         self.assertIsNotNone(snapshot["queue"][0]["eta_seconds"])
         await asyncio.gather(terminal_events(first), terminal_events(second))
+
+    async def test_unknown_running_estimate_produces_unknown_eta(self):
+        first = self.broker.submit(
+            spec(
+                "import time; time.sleep(.12)",
+                label="service",
+                estimate_s=None,
+            )
+        )
+        await asyncio.sleep(0.03)
+        second = self.broker.submit(spec("print(1)", label="waiting"))
+        snapshot = self.broker.snapshot()
+        self.assertIsNone(snapshot["running"][0]["estimate_seconds"])
+        self.assertIsNone(snapshot["queue"][0]["eta_seconds"])
+        await asyncio.gather(terminal_events(first), terminal_events(second))
+
+    async def test_unknown_queued_estimate_only_hides_following_eta(self):
+        first = self.broker.submit(
+            spec("import time; time.sleep(.12)", label="holder")
+        )
+        await asyncio.sleep(0.03)
+        service = self.broker.submit(
+            spec(
+                "import time; time.sleep(.05)",
+                label="service",
+                estimate_s=None,
+            )
+        )
+        trailing = self.broker.submit(spec("print(1)", label="trailing"))
+        snapshot = self.broker.snapshot()
+        self.assertIsNotNone(snapshot["queue"][0]["eta_seconds"])
+        self.assertIsNone(snapshot["queue"][1]["eta_seconds"])
+        await asyncio.gather(
+            terminal_events(first),
+            terminal_events(service),
+            terminal_events(trailing),
+        )
 
     async def test_two_shared_jobs_overlap_on_one_gpu(self):
         first = self.broker.submit(

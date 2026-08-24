@@ -24,6 +24,9 @@ Every job explicitly supplies exactly three scheduling fields:
 
 `shared` is cooperative best-effort isolation, not memory or fault isolation.
 The daemon owns one machine-wide `shared_capacity` limit per GPU (default: 2).
+Runtime estimates affect only advisory ETA. A long-lived job may declare its
+end time unknown; uncertainty propagates only to later starts that depend on
+that job and never changes FIFO order or allocation eligibility.
 
 ## Invariants
 
