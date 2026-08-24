@@ -111,7 +111,9 @@ unknown release time.
 Long-lived services whose stop time is not known should use
 `--estimate unknown`. Their own start ETA can still be known, while jobs whose
 start depends on that service report `eta=unknown` instead of a fabricated
-multi-month duration.
+multi-month duration. A bounded job that runs past its declared estimate also
+makes dependent ETAs unknown; an overdue process is not treated as finishing
+immediately.
 
 Before a request enters the FIFO, the daemon checks that its own unprivileged
 identity can enter the working directory and execute the command. Rejected

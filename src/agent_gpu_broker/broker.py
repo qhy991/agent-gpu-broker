@@ -719,10 +719,11 @@ class GpuBroker:
         for job in self._running_jobs.values():
             if job.started_mono is None:
                 continue
+            elapsed = now - job.started_mono
             remaining = (
                 None
-                if job.spec.estimate_s is None
-                else max(0.0, job.spec.estimate_s - (now - job.started_mono))
+                if job.spec.estimate_s is None or elapsed >= job.spec.estimate_s
+                else job.spec.estimate_s - elapsed
             )
             for gpu_id in job.gpu_ids:
                 if gpu_id not in virtual:

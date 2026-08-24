@@ -26,7 +26,8 @@ Every job explicitly supplies exactly three scheduling fields:
 The daemon owns one machine-wide `shared_capacity` limit per GPU (default: 2).
 Runtime estimates affect only advisory ETA. A long-lived job may declare its
 end time unknown; uncertainty propagates only to later starts that depend on
-that job and never changes FIFO order or allocation eligibility.
+that job. A bounded job that outlives its estimate becomes equally uncertain.
+Neither case changes FIFO order or allocation eligibility.
 
 ## Invariants
 

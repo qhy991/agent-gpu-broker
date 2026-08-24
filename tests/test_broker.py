@@ -168,6 +168,24 @@ class BrokerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(snapshot["queue"][0]["eta_seconds"])
         await asyncio.gather(terminal_events(first), terminal_events(second))
 
+    async def test_overdue_running_estimate_produces_unknown_eta(self):
+        first = self.broker.submit(
+            spec(
+                "import time; time.sleep(.12)",
+                label="overdue",
+                estimate_s=0.02,
+            )
+        )
+        await asyncio.sleep(0.04)
+        second = self.broker.submit(spec("print(1)", label="waiting"))
+        snapshot = self.broker.snapshot()
+        self.assertGreater(
+            snapshot["running"][0]["run_seconds"],
+            snapshot["running"][0]["estimate_seconds"],
+        )
+        self.assertIsNone(snapshot["queue"][0]["eta_seconds"])
+        await asyncio.gather(terminal_events(first), terminal_events(second))
+
     async def test_unknown_queued_estimate_only_hides_following_eta(self):
         first = self.broker.submit(
             spec("import time; time.sleep(.12)", label="holder")
