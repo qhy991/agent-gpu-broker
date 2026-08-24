@@ -845,6 +845,7 @@ class GpuBroker:
                 job.last_notice_mono = now
 
     def _public_job(self, job: Job, now: float) -> dict[str, Any]:
+        wait_end = job.started_mono if job.started_mono is not None else now
         return {
             "job_id": job.job_id,
             "state": job.state,
@@ -855,7 +856,12 @@ class GpuBroker:
             "gpu_ids": list(job.gpu_ids),
             "submitted_at": job.submitted_at,
             "started_at": job.started_at,
-            "wait_seconds": max(0.0, now - job.submitted_mono),
+            "wait_seconds": max(0.0, wait_end - job.submitted_mono),
+            "run_seconds": (
+                max(0.0, now - job.started_mono)
+                if job.started_mono is not None
+                else None
+            ),
             "estimate_seconds": job.spec.estimate_s,
         }
 

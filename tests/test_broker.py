@@ -142,9 +142,15 @@ class BrokerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(snapshot["running"][0]["label"], "running")
         self.assertEqual(snapshot["running"][0]["mode"], "exclusive")
         self.assertEqual(snapshot["running"][0]["gpu_ids"], [0])
+        frozen_wait = snapshot["running"][0]["wait_seconds"]
+        first_run_time = snapshot["running"][0]["run_seconds"]
         self.assertEqual(snapshot["queue"][0]["label"], "queued")
         self.assertEqual(snapshot["queue"][0]["position"], 1)
         self.assertIsNotNone(snapshot["queue"][0]["eta_seconds"])
+        await asyncio.sleep(0.02)
+        later = self.broker.snapshot()["running"][0]
+        self.assertAlmostEqual(later["wait_seconds"], frozen_wait, places=6)
+        self.assertGreater(later["run_seconds"], first_run_time)
         await asyncio.gather(terminal_events(first), terminal_events(second))
 
     async def test_unknown_running_estimate_produces_unknown_eta(self):

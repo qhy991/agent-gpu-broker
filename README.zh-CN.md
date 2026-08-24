@@ -81,7 +81,8 @@ bin/gpuq status
 ```
 
 默认状态输出会显示 broker 版本和进程实例，Agent 可以据此确认实际响应的 endpoint；
-自动化程序可以从 `--json` 读取相同字段。
+自动化程序可以从 `--json` 读取相同字段。运行任务的 `wait_seconds` 在开始时冻结，
+实际执行时长单独通过持续增长的 `run_seconds` 表示。
 
 正确性检查允许共享一张 GPU：
 

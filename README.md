@@ -98,7 +98,8 @@ bin/gpu-run \
 
 The human-readable status header includes the broker version and process
 instance so an agent can confirm which endpoint answered. `--json` exposes the
-same identity fields for automation.
+same identity fields for automation. Running jobs expose a frozen queue
+`wait_seconds` and a separately increasing `run_seconds`.
 
 `--timeout` is a compatibility alias for `--run-timeout`. Durations accept `s`,
 `m`, or `h`. `--label`, `--mode`, and `--gpu-count` are required. Multi-GPU

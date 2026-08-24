@@ -137,7 +137,7 @@ class RunTests(unittest.TestCase):
 class StatusTests(unittest.TestCase):
     def test_human_status_shows_broker_identity(self):
         snapshot = {
-            "broker_version": "0.5.0",
+            "broker_version": "0.5.1",
             "instance_id": "host-pid1-start1",
             "probe_error": None,
             "gpus": [{"gpu_id": 0, "state": "idle"}],
@@ -158,7 +158,7 @@ class StatusTests(unittest.TestCase):
         ):
             with contextlib.redirect_stdout(stdout):
                 self.assertEqual(_status(args), 0)
-        self.assertIn("version=0.5.0", stdout.getvalue())
+        self.assertIn("version=0.5.1", stdout.getvalue())
         self.assertIn("instance=host-pid1-start1", stdout.getvalue())
 
 
