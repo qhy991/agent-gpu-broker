@@ -65,7 +65,9 @@ naming convention.
 `chpst -u` changes the process identity but retains the supervisor environment.
 Do not use it alone from a root-owned service because child workloads may still
 inherit `HOME=/root`. The checked-in runit template establishes the service
-identity and writable cache root explicitly:
+identity and writable cache root explicitly. The daemon itself uses an absolute
+virtual-environment executable, while submitted jobs receive the system tool
+PATH rather than inheriting the broker's private Python environment:
 
 ```bash
 install -d /etc/service/gpu-agent-broker

@@ -61,7 +61,8 @@ service 会创建共享运行目录和状态目录，Unix socket 权限为
 
 `chpst -u` 只切换进程 uid/gid，仍会保留 supervisor 的环境。不要直接从 root
 service 单独使用它，否则子任务可能继续继承 `HOME=/root`。仓库内的 runit 模板会
-显式建立服务身份和可写缓存根目录：
+显式建立服务身份和可写缓存根目录。daemon 本身使用虚拟环境中的绝对可执行路径，
+而提交任务使用系统工具 PATH，不会继承 broker 私有 Python 环境：
 
 ```bash
 install -d /etc/service/gpu-agent-broker

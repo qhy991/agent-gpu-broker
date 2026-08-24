@@ -29,5 +29,5 @@ exec chpst -u gpuq:gpuq-users env \
   USER=gpuq \
   LOGNAME=gpuq \
   XDG_CACHE_HOME="$broker_home/cache" \
-  PATH="$broker_root/.venv/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+  PATH="/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
   "$@"

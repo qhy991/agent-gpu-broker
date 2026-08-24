@@ -224,5 +224,17 @@ class HardeningTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(snapshot["broker_version"], __version__)
 
 
+class DeploymentTests(unittest.TestCase):
+    def test_runit_uses_absolute_broker_and_system_job_path(self):
+        script = (
+            Path(__file__).resolve().parents[1]
+            / "deploy"
+            / "gpu-agent-broker.runit.run"
+        ).read_text()
+        self.assertIn('"$broker_root/.venv/bin/gpuq" serve', script)
+        self.assertNotIn('PATH="$broker_root/.venv/bin:', script)
+        self.assertIn('PATH="/usr/local/cuda/bin:', script)
+
+
 if __name__ == "__main__":
     unittest.main()
