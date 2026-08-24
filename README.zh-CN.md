@@ -80,6 +80,9 @@ systemctl --user enable --now gpu-agent-broker.service
 bin/gpuq status
 ```
 
+默认状态输出会显示 broker 版本和进程实例，Agent 可以据此确认实际响应的 endpoint；
+自动化程序可以从 `--json` 读取相同字段。
+
 正确性检查允许共享一张 GPU：
 
 ```bash
@@ -124,6 +127,10 @@ bin/gpu-run \
 `--queue-timeout` 和 `--run-timeout` 分别限制排队时间和实际运行时间，排队不会
 消耗运行预算。`--timeout` 是 `--run-timeout` 的兼容别名，时间支持 `s`、`m`、
 `h` 后缀。
+
+任务进入 FIFO 前，daemon 会用自身的无特权身份检查工作目录和可执行命令。被拒绝
+的请求返回 127，且不会占用 GPU。Ctrl-C 会显式发送取消请求；服务端断连检测仍作为
+兜底路径。
 
 等待期间，Agent 会持续收到位置变化和心跳消息：
 

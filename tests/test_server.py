@@ -39,6 +39,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
             poll_interval_s=0.01,
             heartbeat_s=0.03,
         )
+        self.broker = broker
         self.socket_path = root / "gpuq.sock"
         self.server = BrokerServer(broker, self.socket_path)
         await self.server.start()
@@ -124,6 +125,125 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         )
         event = await receive(reader)
         self.assertEqual(event["type"], "error")
+        writer.close()
+        await writer.wait_closed()
+
+    async def test_running_disconnect_preserves_cancel_reason_and_releases_gpu(self):
+        reader, writer = await asyncio.open_unix_connection(self.socket_path)
+        await send(
+            writer,
+            {
+                "op": "run",
+                "argv": [sys.executable, "-c", "import time; time.sleep(30)"],
+                "cwd": str(Path.cwd()),
+                "owner": "agent-a",
+                "label": "disconnect-me",
+                "mode": "exclusive",
+                "gpu_count": 1,
+                "estimate_s": 30,
+                "run_timeout_s": 60,
+            },
+        )
+        while (await receive(reader))["type"] != "started":
+            pass
+        writer.close()
+        await writer.wait_closed()
+
+        for _ in range(100):
+            snapshot = self.broker.snapshot()
+            if snapshot["recent"]:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            self.fail("disconnected job did not reach a terminal state")
+
+        result = snapshot["recent"][0]
+        self.assertEqual(result["state"], "cancelled")
+        self.assertEqual(result["reason"], "client disconnected")
+        self.assertEqual(snapshot["running"], [])
+        self.assertNotIn("jobs", snapshot["gpus"][0])
+
+    async def test_broken_event_stream_cancels_running_job(self):
+        reader, writer = await asyncio.open_unix_connection(self.socket_path)
+        await send(
+            writer,
+            {
+                "op": "run",
+                "argv": [
+                    sys.executable,
+                    "-c",
+                    "import time; time.sleep(.05); print('late', flush=True); time.sleep(30)",
+                ],
+                "cwd": str(Path.cwd()),
+                "owner": "agent-a",
+                "label": "broken-stream",
+                "mode": "exclusive",
+                "gpu_count": 1,
+                "estimate_s": 30,
+                "run_timeout_s": 60,
+            },
+        )
+        while (await receive(reader))["type"] != "started":
+            pass
+
+        async def broken_send(_writer, _value):
+            raise BrokenPipeError("simulated broken event stream")
+
+        self.server._send = broken_send
+        for _ in range(200):
+            snapshot = self.broker.snapshot()
+            if snapshot["recent"]:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            self.fail("broken event stream did not cancel the running job")
+
+        result = snapshot["recent"][0]
+        self.assertEqual(result["state"], "cancelled")
+        self.assertEqual(result["reason"], "client disconnected")
+        self.assertEqual(snapshot["running"], [])
+        writer.close()
+        await writer.wait_closed()
+
+    async def test_explicit_cancel_preserves_reason(self):
+        reader, writer = await asyncio.open_unix_connection(self.socket_path)
+        await send(
+            writer,
+            {
+                "op": "run",
+                "argv": [sys.executable, "-c", "import time; time.sleep(30)"],
+                "cwd": str(Path.cwd()),
+                "owner": "agent-a",
+                "label": "cancel-me",
+                "mode": "exclusive",
+                "gpu_count": 1,
+                "estimate_s": 30,
+                "run_timeout_s": 60,
+            },
+        )
+        job_id = None
+        while True:
+            event = await receive(reader)
+            if event["type"] == "accepted":
+                job_id = event["job_id"]
+            if event["type"] == "started":
+                break
+        self.assertIsNotNone(job_id)
+
+        cancel_reader, cancel_writer = await asyncio.open_unix_connection(
+            self.socket_path
+        )
+        await send(cancel_writer, {"op": "cancel", "job_id": job_id})
+        self.assertTrue((await receive(cancel_reader))["ok"])
+        cancel_writer.close()
+        await cancel_writer.wait_closed()
+
+        while True:
+            terminal = await receive(reader)
+            if terminal["type"] == "finished":
+                break
+        self.assertEqual(terminal["state"], "cancelled")
+        self.assertEqual(terminal["reason"], "cancel requested")
         writer.close()
         await writer.wait_closed()
 

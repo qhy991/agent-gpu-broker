@@ -11,6 +11,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from agent_gpu_broker import __version__
 from agent_gpu_broker.broker import GpuBroker, JobSpec
 
 
@@ -31,6 +32,7 @@ def spec(
     label: str,
     cwd: str | None = None,
     run_timeout_s: float = 5.0,
+    env: dict[str, str] | None = None,
 ) -> JobSpec:
     return JobSpec(
         argv=argv,
@@ -42,6 +44,7 @@ def spec(
         estimate_s=0.2,
         run_timeout_s=run_timeout_s,
         queue_timeout_s=None,
+        env=env or {},
     )
 
 
@@ -76,6 +79,93 @@ class HardeningTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(event["state"], "failed")
         self.assertEqual(event["exit_code"], 127)
         self.assertIn("preflight", event["reason"])
+        snapshot = self.broker.snapshot()
+        self.assertEqual(snapshot["running"], [])
+        self.assertEqual(snapshot["queue"], [])
+        self.assertNotIn("jobs", snapshot["gpus"][0])
+
+        valid = spec(
+            (sys.executable, "-c", "print('runs after rejection')"),
+            label="after-rejection",
+        )
+        followup = await terminal_event(self.broker.submit(valid))
+        self.assertEqual(followup["state"], "completed")
+        self.assertGreaterEqual(followup["wait_seconds"], 0)
+        self.assertEqual(followup["broker_version"], __version__)
+        self.assertEqual(
+            followup["broker_instance_id"], self.broker.snapshot()["instance_id"]
+        )
+
+    async def test_preflight_rejects_before_waiting_for_gpu(self):
+        holder = self.broker.submit(
+            spec(
+                (sys.executable, "-c", "import time; time.sleep(5)"),
+                label="holder",
+            )
+        )
+        while True:
+            event = await asyncio.wait_for(holder.events.get(), timeout=1)
+            if event["type"] == "started":
+                break
+
+        missing = self.broker.submit(
+            spec(("/nonexistent/binary",), label="reject-with-busy-gpu")
+        )
+        rejected = await asyncio.wait_for(terminal_event(missing), timeout=0.2)
+        self.assertEqual(rejected["exit_code"], 127)
+        self.assertEqual(self.broker.snapshot()["queue"], [])
+        self.assertTrue(await self.broker.cancel(holder.job_id, reason="test cleanup"))
+
+    async def test_preflight_uses_job_path_and_cwd(self):
+        work = Path(self.temp.name) / "work"
+        tools = work / "tools"
+        tools.mkdir(parents=True)
+        executable = tools / "probe"
+        executable.write_text("#!/bin/sh\nexit 0\n")
+        executable.chmod(0o755)
+
+        on_path = spec(
+            ("probe",),
+            label="job-path",
+            cwd=str(work),
+            env={"PATH": "tools"},
+        )
+        self.assertEqual((await terminal_event(self.broker.submit(on_path)))["state"], "completed")
+
+        relative = spec(("./tools/probe",), label="relative-exe", cwd=str(work))
+        self.assertEqual((await terminal_event(self.broker.submit(relative)))["state"], "completed")
+
+    async def test_preflight_rejects_missing_cwd(self):
+        missing_cwd = Path(self.temp.name) / "does-not-exist"
+        job = spec(
+            (sys.executable, "-c", "print('never runs')"),
+            label="missing-cwd",
+            cwd=str(missing_cwd),
+        )
+        event = await terminal_event(self.broker.submit(job))
+        self.assertEqual(event["exit_code"], 127)
+        self.assertIn("cwd", event["reason"])
+
+    async def test_cancel_before_execute_starts_releases_allocation(self):
+        job = self.broker.submit(
+            spec(
+                (sys.executable, "-c", "import time; time.sleep(30)"),
+                label="cancel-before-coroutine-start",
+            )
+        )
+        self.assertIs(self.broker._queue.popleft(), job)
+        gpu_ids = self.broker._try_allocate(job, {0: []})
+        self.assertEqual(gpu_ids, (0,))
+        self.broker._start_job(job, gpu_ids)
+
+        self.assertTrue(
+            await self.broker.cancel(job.job_id, reason="cancel before start")
+        )
+        snapshot = self.broker.snapshot()
+        self.assertEqual(snapshot["running"], [])
+        self.assertEqual(snapshot["queue"], [])
+        self.assertNotIn("jobs", snapshot["gpus"][0])
+        self.assertEqual(snapshot["recent"][0]["reason"], "cancel before start")
 
     async def test_preflight_rejects_inaccessible_cwd(self):
         secret = Path(self.temp.name) / "secret"
@@ -131,7 +221,7 @@ class HardeningTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("broker_version", snapshot)
         self.assertIn("instance_id", snapshot)
         self.assertTrue(snapshot["instance_id"])
-        self.assertTrue(snapshot["broker_version"])
+        self.assertEqual(snapshot["broker_version"], __version__)
 
 
 if __name__ == "__main__":

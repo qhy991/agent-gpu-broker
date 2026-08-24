@@ -1,0 +1,33 @@
+#!/bin/sh
+set -eu
+
+broker_root=${GPUQ_INSTALL_ROOT:-/opt/agent-gpu-broker}
+broker_home=${GPUQ_HOME:-/var/lib/agent-gpu-broker}
+broker_lock_dir=${GPUQ_LOCK_DIR:-/run/agent-gpu-broker/locks}
+broker_socket=${GPUQ_SOCKET:-/tmp/agent-gpu-broker.sock}
+shared_capacity=${GPUQ_SHARED_CAPACITY:-2}
+
+install -d -m 0770 -o gpuq -g gpuq-users \
+  "$broker_home" "$broker_home/cache" "$broker_lock_dir"
+umask 0007
+
+set -- \
+  "$broker_root/.venv/bin/gpuq" serve \
+  --socket "$broker_socket" \
+  --state-dir "$broker_home" \
+  --lock-dir "$broker_lock_dir" \
+  --shared-capacity "$shared_capacity"
+
+if [ -n "${GPUQ_GPUS:-}" ]; then
+  set -- "$@" --gpus "$GPUQ_GPUS"
+fi
+
+# chpst changes uid/gid but intentionally retains the supervisor environment.
+# Override login-derived paths so child workloads never fall back to /root.
+exec chpst -u gpuq:gpuq-users env \
+  HOME="$broker_home" \
+  USER=gpuq \
+  LOGNAME=gpuq \
+  XDG_CACHE_HOME="$broker_home/cache" \
+  PATH="$broker_root/.venv/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+  "$@"

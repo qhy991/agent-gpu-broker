@@ -86,12 +86,26 @@ class BrokerServer:
             done, pending = await asyncio.wait(
                 {forward, disconnected}, return_when=asyncio.FIRST_COMPLETED
             )
-            if disconnected in done and not forward.done():
-                await self.broker.cancel(job.job_id, reason="client disconnected")
-                await forward
-            for task in pending:
-                task.cancel()
-            await asyncio.gather(*pending, return_exceptions=True)
+            try:
+                connection_lost = disconnected in done
+                if disconnected in done:
+                    try:
+                        disconnected.result()
+                    except (BrokenPipeError, ConnectionResetError, OSError):
+                        connection_lost = True
+                if forward in done:
+                    try:
+                        forward.result()
+                    except (BrokenPipeError, ConnectionResetError, OSError):
+                        connection_lost = True
+                if connection_lost:
+                    await self.broker.cancel(
+                        job.job_id, reason="client disconnected"
+                    )
+            finally:
+                for task in pending:
+                    task.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
         except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
             await self._safe_send(writer, {"type": "error", "message": str(exc)})
         except (BrokenPipeError, ConnectionResetError):
@@ -103,7 +117,10 @@ class BrokerServer:
                 await self.broker.cancel(job_id, reason="client handler failed")
         finally:
             writer.close()
-            await writer.wait_closed()
+            try:
+                await writer.wait_closed()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
 
     async def _forward_events(
         self, events: asyncio.Queue[dict[str, Any]], writer: asyncio.StreamWriter

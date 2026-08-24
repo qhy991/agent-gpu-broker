@@ -15,11 +15,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from . import __version__
 from .gpu import CardLock, GpuInventory, NvidiaSmiInventory, try_card_lock
 
 MODES = frozenset({"shared", "exclusive"})
 
-BROKER_VERSION = "0.4.0"
+BROKER_VERSION = __version__
 
 # Jobs that exit this fast with a permission error in their stderr almost
 # always lost a race between admission and the workload's first file access
@@ -48,22 +49,33 @@ def _preflight_error(spec: "JobSpec") -> str | None:
     preflight failure instead of a confusing exit-1 (or worse, a swallowed
     exit-0 from a wrapper script).
     """
-    executable = spec.argv[0]
-    if "/" not in executable and not _resolve_on_path(executable):
-        return f"preflight: executable not found on PATH: {executable}"
-    if not os.access(executable if "/" in executable else _resolve_on_path(executable) or "", os.X_OK):
-        return f"preflight: executable not accessible: {executable}"
     cwd = Path(spec.cwd)
-    real_cwd = cwd.resolve()
-    if not os.access(real_cwd, os.R_OK | os.X_OK):
+    if not cwd.is_dir() or not os.access(cwd, os.X_OK):
         return f"preflight: cwd not accessible to broker identity: {cwd}"
+
+    executable = spec.argv[0]
+    environment = {**os.environ, **spec.env}
+    if "/" in executable:
+        candidate = Path(executable)
+        if not candidate.is_absolute():
+            candidate = cwd / candidate
+        if not candidate.is_file() or not os.access(candidate, os.X_OK):
+            return f"preflight: executable not accessible: {executable}"
+    elif _resolve_on_path(
+        executable,
+        search_path=environment.get("PATH", os.defpath),
+        cwd=cwd,
+    ) is None:
+        return f"preflight: executable not found on PATH: {executable}"
     return None
 
 
-def _resolve_on_path(executable: str) -> str | None:
-    search = os.environ.get("PATH", os.defpath).split(os.pathsep)
-    for directory in search:
-        candidate = Path(directory) / executable
+def _resolve_on_path(executable: str, *, search_path: str, cwd: Path) -> str | None:
+    for directory in search_path.split(os.pathsep):
+        base = Path(directory) if directory else cwd
+        if not base.is_absolute():
+            base = cwd / base
+        candidate = base / executable
         if candidate.is_file() and os.access(candidate, os.X_OK):
             return str(candidate)
     return None
@@ -101,6 +113,7 @@ class Job:
     process: asyncio.subprocess.Process | None = None
     stderr_tail: bytearray = field(default_factory=bytearray)
     task: asyncio.Task[None] | None = None
+    cancel_reason: str | None = None
     last_queue_key: tuple[Any, ...] | None = None
     last_notice_mono: float = 0.0
 
@@ -265,7 +278,6 @@ class GpuBroker:
             submitted_mono=time.monotonic(),
         )
         self._jobs[job.job_id] = job
-        self._queue.append(job)
         self._store.record_request(job)
         self._emit(
             job,
@@ -278,6 +290,12 @@ class GpuBroker:
             },
         )
         self._record_lifecycle(job, "accepted")
+        preflight = _preflight_error(job.spec)
+        if preflight is not None:
+            self._record_lifecycle(job, "preflight_rejected")
+            self._finish(job, state="failed", exit_code=127, reason=preflight)
+            return job
+        self._queue.append(job)
         self._publish_queue(force=True)
         self._write_status()
         self._wakeup.set()
@@ -294,8 +312,20 @@ class GpuBroker:
             self._wakeup.set()
             return True
         if job.task is not None:
+            job.cancel_reason = reason
             job.task.cancel()
             await asyncio.gather(job.task, return_exceptions=True)
+            # A task cancelled before its coroutine first runs never reaches
+            # _execute's finally block. Close that narrow allocation race here.
+            if job.job_id in self._jobs:
+                self._release_allocation(job)
+                self._finish(
+                    job,
+                    state="cancelled",
+                    exit_code=130,
+                    reason=reason,
+                )
+                self._wakeup.set()
             return True
         return False
 
@@ -479,12 +509,6 @@ class GpuBroker:
         state = "failed"
         exit_code = 1
         reason: str | None = None
-        preflight = _preflight_error(job.spec)
-        if preflight is not None:
-            self._record_lifecycle(job, "preflight_rejected")
-            self._finish(job, state="failed", exit_code=127, reason=preflight)
-            self._wakeup.set()
-            return
         try:
             environment = {
                 **os.environ,
@@ -529,7 +553,7 @@ class GpuBroker:
                 exit_code = 124
             await asyncio.gather(*output_tasks, return_exceptions=True)
         except asyncio.CancelledError:
-            reason = "client disconnected or job cancelled"
+            reason = job.cancel_reason or "job cancelled"
             if job.process is not None:
                 await self._terminate(job.process)
             await asyncio.gather(*output_tasks, return_exceptions=True)
@@ -637,11 +661,16 @@ class GpuBroker:
         if job.job_id not in self._jobs:
             return
         completed_at = _utc_now()
+        completed_mono = time.monotonic()
         duration_s = (
-            max(0.0, time.monotonic() - job.started_mono)
+            max(0.0, completed_mono - job.started_mono)
             if job.started_mono is not None
             else None
         )
+        wait_end = (
+            job.started_mono if job.started_mono is not None else completed_mono
+        )
+        wait_s = max(0.0, wait_end - job.submitted_mono)
         result = {
             "job_id": job.job_id,
             "state": state,
@@ -655,7 +684,10 @@ class GpuBroker:
             "submitted_at": job.submitted_at,
             "started_at": job.started_at,
             "completed_at": completed_at,
+            "wait_seconds": wait_s,
             "duration_seconds": duration_s,
+            "broker_version": BROKER_VERSION,
+            "broker_instance_id": self._instance_id,
         }
         warning = self._swallowed_failure_warning(job, duration_s)
         if warning is not None:

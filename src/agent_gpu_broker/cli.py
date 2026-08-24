@@ -162,6 +162,10 @@ def _status(args: argparse.Namespace) -> int:
     if args.json:
         print(json.dumps(snapshot, indent=2, ensure_ascii=False))
         return 0
+    print(
+        f"BROKER version={snapshot.get('broker_version', 'unknown')} "
+        f"instance={snapshot.get('instance_id', 'unknown')}"
+    )
     if snapshot.get("probe_error"):
         print(f"probe error: {snapshot['probe_error']}")
     print("GPUS")
@@ -198,18 +202,23 @@ def _status(args: argparse.Namespace) -> int:
 
 def _cancel(args: argparse.Namespace) -> int:
     try:
-        client, connection = _request(
-            args.socket, {"op": "cancel", "job_id": args.job_id}
-        )
-        with client, connection:
-            response = json.loads(connection.readline())
+        cancelled = _request_cancel(args.socket, args.job_id)
     except (OSError, RuntimeError, json.JSONDecodeError) as exc:
         print(f"gpuq: {exc}", file=sys.stderr)
         return 1
-    if not response.get("ok"):
+    if not cancelled:
         print(f"gpuq: active job not found: {args.job_id}", file=sys.stderr)
         return 1
     return 0
+
+
+def _request_cancel(socket_path: Path, job_id: str) -> bool:
+    client, connection = _request(
+        socket_path, {"op": "cancel", "job_id": job_id}
+    )
+    with client, connection:
+        response = json.loads(connection.readline())
+    return bool(response.get("ok"))
 
 
 def _parse_env(values: list[str]) -> dict[str, str]:
@@ -254,52 +263,72 @@ def _run(args: argparse.Namespace) -> int:
         return 1
 
     exit_code = 1
+    job_id: str | None = None
     try:
-        with client, connection:
-            for line in connection:
-                event = json.loads(line)
-                kind = event.get("type")
-                if kind == "accepted":
-                    _note(
-                        f"accepted job {event['job_id']} label={event['label']} "
-                        f"mode={event['mode']} gpus={event['gpu_count']}"
-                    )
-                elif kind == "queued":
-                    message = (
-                        f"queued position={event['position']}/{event['queue_length']} "
-                        f"eta={_format_eta(event.get('eta_seconds'))}"
-                    )
-                    if event.get("probe_error"):
-                        message += f" probe_error={event['probe_error']}"
-                    _note(message)
-                elif kind == "started":
-                    _note(
-                        "running on physical GPUs "
-                        f"{','.join(map(str, event['gpu_ids']))} "
-                        f"(run limit {_format_eta(event['run_timeout_s'])})"
-                    )
-                elif kind == "output":
-                    stream = sys.stderr if event["stream"] == "stderr" else sys.stdout
-                    stream.write(event["data"])
-                    stream.flush()
-                elif kind == "finished":
-                    reason = f" reason={event['reason']}" if event.get("reason") else ""
-                    _note(
-                        f"finished state={event['state']} exit={event['exit_code']}{reason}"
-                    )
-                    exit_code = int(event["exit_code"])
-                    break
-                elif kind == "error":
-                    print(f"gpu-run: broker error: {event['message']}", file=sys.stderr)
-                    exit_code = 1
-                    break
+        for line in connection:
+            event = json.loads(line)
+            kind = event.get("type")
+            if kind == "accepted":
+                job_id = str(event["job_id"])
+                _note(
+                    f"accepted job {event['job_id']} label={event['label']} "
+                    f"mode={event['mode']} gpus={event['gpu_count']}"
+                )
+            elif kind == "queued":
+                message = (
+                    f"queued position={event['position']}/{event['queue_length']} "
+                    f"eta={_format_eta(event.get('eta_seconds'))}"
+                )
+                if event.get("probe_error"):
+                    message += f" probe_error={event['probe_error']}"
+                _note(message)
+            elif kind == "started":
+                _note(
+                    "running on physical GPUs "
+                    f"{','.join(map(str, event['gpu_ids']))} "
+                    f"(run limit {_format_eta(event['run_timeout_s'])})"
+                )
+            elif kind == "output":
+                stream = sys.stderr if event["stream"] == "stderr" else sys.stdout
+                stream.write(event["data"])
+                stream.flush()
+            elif kind == "finished":
+                if event.get("warning"):
+                    _note(f"warning: {event['warning']}")
+                reason = f" reason={event['reason']}" if event.get("reason") else ""
+                _note(
+                    f"finished state={event['state']} exit={event['exit_code']}{reason}"
+                )
+                exit_code = int(event["exit_code"])
+                break
+            elif kind == "error":
+                print(f"gpu-run: broker error: {event['message']}", file=sys.stderr)
+                exit_code = 1
+                break
     except KeyboardInterrupt:
-        _note("interrupted; cancelling job")
-        return 130
+        return _interrupt_and_cancel(args.socket, job_id)
     except (OSError, json.JSONDecodeError) as exc:
         print(f"gpu-run: connection failed: {exc}", file=sys.stderr)
         return 1
+    finally:
+        connection.close()
+        client.close()
     return exit_code
+
+
+def _interrupt_and_cancel(socket_path: Path, job_id: str | None) -> int:
+    if job_id is None:
+        _note("interrupted before broker accepted the job")
+        return 130
+    _note(f"interrupted; requesting cancellation for {job_id}")
+    try:
+        if _request_cancel(socket_path, job_id):
+            _note(f"cancellation confirmed for {job_id}")
+        else:
+            _note(f"job {job_id} is already terminal or cancelling")
+    except (OSError, RuntimeError, json.JSONDecodeError) as exc:
+        _note(f"explicit cancellation could not be confirmed: {exc}")
+    return 130
 
 
 def _note(message: str) -> None:

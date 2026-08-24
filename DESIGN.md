@@ -42,6 +42,8 @@ The daemon owns one machine-wide `shared_capacity` limit per GPU (default: 2).
    them as logical devices `0..gpu_count-1`.
 9. Command exit status is returned unchanged, except broker timeouts use 124 and
    explicit cancellation uses 130.
+10. Admission checks run before FIFO insertion and allocation. A rejected
+    request cannot delay another job or retain a GPU lock.
 
 ## Failure semantics
 
@@ -51,6 +53,7 @@ The daemon owns one machine-wide `shared_capacity` limit per GPU (default: 2).
 - Queue timeout: remove the job without launching a command; exit 124.
 - Run timeout: terminate the process group, then release every GPU; exit 124.
 - Daemon shutdown or client disconnect: terminate the process group; exit 130.
+- Explicit cancellation and disconnect retain their exact terminal reason.
 - Existing foreign activity: leave that card parked until a later clean probe.
 
 ## Acceptance evidence
@@ -61,10 +64,12 @@ The daemon owns one machine-wide `shared_capacity` limit per GPU (default: 2).
   all.
 - Status and streamed events expose label, mode, requested count, allocated GPU
   IDs, queue position, and advisory ETA.
+- A rejected executable or cwd reaches exit 127 without entering the queue or
+  appearing in the running allocation set.
 
 ## Scope
 
-Version 0.2 targets trusted agents running under one Unix identity, or a trusted
+Version 0.4 targets trusted agents running under one Unix identity, or a trusted
 group that accepts commands running as the daemon user. It does not provide
 hostile multi-tenant isolation, distributed multi-node scheduling, priorities,
 preemption, memory quotas, or recovery of live commands after daemon restart.

@@ -60,6 +60,29 @@ lingering is not required. To coordinate with another local GPU scheduler,
 configure both systems to use `/run/agent-gpu-broker/locks` and the same file
 naming convention.
 
+### Runit hosts
+
+`chpst -u` changes the process identity but retains the supervisor environment.
+Do not use it alone from a root-owned service because child workloads may still
+inherit `HOME=/root`. The checked-in runit template establishes the service
+identity and writable cache root explicitly:
+
+```bash
+install -d /etc/service/gpu-agent-broker
+install -m755 \
+  /opt/agent-gpu-broker/deploy/gpu-agent-broker.runit.run \
+  /etc/service/gpu-agent-broker/run
+```
+
+The template auto-discovers GPUs. Set `GPUQ_GPUS=0` in the supervisor
+environment when the broker must manage only physical GPU 0. After runit starts
+the service, verify both the daemon identity and the broker endpoint:
+
+```bash
+ps -o user,pid,args -C gpuq
+gpuq status
+```
+
 ## Security boundary
 
 This deployment is suitable only for a trusted team using shared workspaces. It

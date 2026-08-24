@@ -96,12 +96,21 @@ bin/gpu-run \
   -- torchrun --nproc-per-node=2 test.py
 ```
 
+The human-readable status header includes the broker version and process
+instance so an agent can confirm which endpoint answered. `--json` exposes the
+same identity fields for automation.
+
 `--timeout` is a compatibility alias for `--run-timeout`. Durations accept `s`,
 `m`, or `h`. `--label`, `--mode`, and `--gpu-count` are required. Multi-GPU
 allocation is atomic. Queue position is exact FIFO order; a blocked head job is
 not bypassed. ETA is advisory and accounts for declared estimates, requested GPU
 counts, shared slots, and running broker jobs; externally occupied GPUs have an
 unknown release time.
+
+Before a request enters the FIFO, the daemon checks that its own unprivileged
+identity can enter the working directory and execute the command. Rejected
+requests return exit 127 without reserving a GPU. Ctrl-C sends an explicit
+cancellation request; disconnect detection remains the server-side fallback.
 
 Status messages are emitted when position/ETA changes and as a periodic heartbeat:
 

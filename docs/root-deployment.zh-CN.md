@@ -57,6 +57,27 @@ service 会创建共享运行目录和状态目录，Unix socket 权限为
 其他本机 GPU 调度器协作，应让它们共同使用 `/run/agent-gpu-broker/locks`，并采用
 相同的锁文件命名规则。
 
+### Runit 主机
+
+`chpst -u` 只切换进程 uid/gid，仍会保留 supervisor 的环境。不要直接从 root
+service 单独使用它，否则子任务可能继续继承 `HOME=/root`。仓库内的 runit 模板会
+显式建立服务身份和可写缓存根目录：
+
+```bash
+install -d /etc/service/gpu-agent-broker
+install -m755 \
+  /opt/agent-gpu-broker/deploy/gpu-agent-broker.runit.run \
+  /etc/service/gpu-agent-broker/run
+```
+
+模板默认自动发现 GPU；若 broker 只应管理物理 GPU 0，应在 supervisor 环境中设置
+`GPUQ_GPUS=0`。runit 启动服务后同时检查 daemon 身份和 broker endpoint：
+
+```bash
+ps -o user,pid,args -C gpuq
+gpuq status
+```
+
 ## 安全边界
 
 这种部署只适用于共享工作目录的可信团队，无法保留每个调用者的 Unix 身份。如果
