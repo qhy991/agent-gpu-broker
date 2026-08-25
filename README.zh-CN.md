@@ -13,6 +13,9 @@
 
 其他本机调度器可以与 broker 使用同一个逐卡锁目录，从而避免主动混用同一张卡。
 
+v0.6.0 在 A800/B200 上的精确 admission-receipt 验收见
+[qualification report](docs/v0.6.0-admission-receipt-qualification-2026-08-25.md)。
+
 ## 架构
 
 ```text

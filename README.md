@@ -10,6 +10,9 @@ The broker is deliberately single-host. Each job requests `shared` correctness
 capacity or `exclusive` clean-card capacity and one or more GPUs. Cooperating
 local schedulers can use its per-card lock directory to avoid co-tenancy.
 
+The exact v0.6.0 A800/B200 admission-receipt qualification is recorded in
+[the qualification report](docs/v0.6.0-admission-receipt-qualification-2026-08-25.md).
+
 ## Architecture
 
 ```text

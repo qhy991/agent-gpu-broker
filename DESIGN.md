@@ -84,7 +84,7 @@ Neither case changes FIFO order or allocation eligibility.
 
 ## Scope
 
-Version 0.4 targets trusted agents running under one Unix identity, or a trusted
+Version 0.6 targets trusted agents running under one Unix identity, or a trusted
 group that accepts commands running as the daemon user. It does not provide
 hostile multi-tenant isolation, distributed multi-node scheduling, priorities,
 preemption, memory quotas, or recovery of live commands after daemon restart.
