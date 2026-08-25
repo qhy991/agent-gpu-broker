@@ -29,6 +29,9 @@ daemon 是调度状态的唯一所有者。共享状态目录只保存以下只�
 - `events.jsonl`：任务接受、启动和结束事件；
 - `jobs/<job-id>/`：请求信息、标准输出、标准错误和结果 JSON。
 
+每个获准任务还会生成 mode-0600 的 `jobs/<job-id>/admission.json`，由 broker
+拥有并投影真实 launch identity。
+
 ## 安装
 
 共享机器上无需安装，仓库中的启动脚本会直接使用系统 Python：
@@ -149,6 +152,38 @@ ETA 是根据任务声明的 `--estimate`、GPU 数量、共享槽位和正在�
 计算，但依赖该服务结束的后续任务会显示 `eta=unknown`，而不是伪造一个数月后的
 时间。有限任务超过其声明 estimate 后，依赖它的 ETA 也会转为 `unknown`；逾期进程
 不会被假定为立即结束。
+
+## Broker admission receipt
+
+长驻 evaluator 可以让 `gpu-run` 在进程启动后原子保存 broker 签发的 receipt：
+
+```bash
+gpu-run \
+  --label fibserve-campaign \
+  --mode exclusive \
+  --gpu-count 1 \
+  --estimate unknown \
+  --run-timeout 2h \
+  --receipt-out /path/to/fibserve-admission.json \
+  --env SERVICE_PORT=10000 \
+  -- /path/to/start-fibserve.sh
+```
+
+任务存活期间，独立控制面可通过 broker socket 重新查询同一 receipt：
+
+```bash
+gpuq receipt gpuq-<job-id> --out /path/to/live-admission.json
+```
+
+`gpuq.admission-receipt.v1` 绑定 canonical launch spec、argv、显式 environment
+override、cwd、owner、label、资源模式、超时、解析后的 executable 路径与文件
+SHA-256、broker instance、GPU allocation，以及包含 broker-owned
+`CUDA_VISIBLE_DEVICES` 的完整有效环境 SHA-256。receipt 只公开 environment key 与
+digest，不公开 value。
+
+broker 会在 admission 时 fingerprint executable，并在 spawn 前再次检查；内容或
+路径漂移会在命令启动前失败。任务结束后 live receipt 查询关闭，私有 job 目录和
+terminal result 继续保留证据 digest。
 
 ## 共享模式的边界
 

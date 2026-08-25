@@ -48,6 +48,12 @@ Neither case changes FIFO order or allocation eligibility.
    explicit cancellation uses 130.
 10. Admission checks run before FIFO insertion and allocation. A rejected
     request cannot delay another job or retain a GPU lock.
+11. Every admitted job has one broker-issued receipt derived from the exact
+    launch spec. It binds argv, cwd, explicit environment overrides, resolved
+    executable content, broker instance, and—after start—allocation and the
+    effective environment without exposing environment values.
+12. The broker rechecks executable path and content immediately before spawn.
+    Drift is a launch failure and cannot execute on a GPU.
 
 ## Failure semantics
 
@@ -59,6 +65,8 @@ Neither case changes FIFO order or allocation eligibility.
 - Daemon shutdown or client disconnect: terminate the process group; exit 130.
 - Explicit cancellation and disconnect retain their exact terminal reason.
 - Existing foreign activity: leave that card parked until a later clean probe.
+- Executable drift after admission: fail before spawn, record the admission
+  digest, and release the allocation.
 
 ## Acceptance evidence
 
@@ -70,6 +78,9 @@ Neither case changes FIFO order or allocation eligibility.
   IDs, queue position, and advisory ETA.
 - A rejected executable or cwd reaches exit 127 without entering the queue or
   appearing in the running allocation set.
+- An active service receipt can be queried independently by job id and matches
+  the receipt streamed at start; live receipt lookup closes when the job is
+  terminal.
 
 ## Scope
 

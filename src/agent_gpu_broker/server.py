@@ -75,6 +75,14 @@ class BrokerServer:
                 cancelled = await self.broker.cancel(target, reason="cancel requested")
                 await self._send(writer, {"type": "cancelled", "ok": cancelled})
                 return
+            if operation == "receipt":
+                target = str(request.get("job_id", ""))
+                receipt = self.broker.admission_receipt(target)
+                await self._send(
+                    writer,
+                    {"type": "receipt", "ok": receipt is not None, "receipt": receipt},
+                )
+                return
             if operation != "run":
                 raise ValueError(f"unknown operation: {operation!r}")
 

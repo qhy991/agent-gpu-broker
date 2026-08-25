@@ -10,6 +10,7 @@ import os
 import signal
 import socket
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -74,6 +75,13 @@ def _parser() -> argparse.ArgumentParser:
     cancel.add_argument("job_id")
     cancel.add_argument("--socket", type=Path, default=DEFAULT_SOCKET)
 
+    receipt = subparsers.add_parser(
+        "receipt", help="show one active job's broker-issued admission receipt"
+    )
+    receipt.add_argument("job_id")
+    receipt.add_argument("--socket", type=Path, default=DEFAULT_SOCKET)
+    receipt.add_argument("--out", type=Path)
+
     run = subparsers.add_parser("run", help="queue and run one GPU command")
     run.add_argument("--socket", type=Path, default=DEFAULT_SOCKET)
     run.add_argument("--label", required=True, help="human-readable job name")
@@ -91,6 +99,11 @@ def _parser() -> argparse.ArgumentParser:
         default=900.0,
     )
     run.add_argument("--env", action="append", default=[], metavar="KEY=VALUE")
+    run.add_argument(
+        "--receipt-out",
+        type=Path,
+        help="atomically write the started job's broker-issued admission receipt",
+    )
     run.add_argument("argv", nargs=argparse.REMAINDER)
     return parser
 
@@ -103,6 +116,8 @@ def main(argv: list[str] | None = None) -> int:
         return _status(args)
     if args.command == "cancel":
         return _cancel(args)
+    if args.command == "receipt":
+        return _receipt(args)
     if args.command == "run":
         return _run(args)
     raise AssertionError(args.command)
@@ -227,6 +242,27 @@ def _request_cancel(socket_path: Path, job_id: str) -> bool:
     return bool(response.get("ok"))
 
 
+def _receipt(args: argparse.Namespace) -> int:
+    try:
+        client, connection = _request(
+            args.socket, {"op": "receipt", "job_id": args.job_id}
+        )
+        with client, connection:
+            response = json.loads(connection.readline())
+    except (OSError, RuntimeError, json.JSONDecodeError) as exc:
+        print(f"gpuq: {exc}", file=sys.stderr)
+        return 1
+    receipt = response.get("receipt")
+    if not response.get("ok") or not isinstance(receipt, dict):
+        print(f"gpuq: active job receipt not found: {args.job_id}", file=sys.stderr)
+        return 1
+    if args.out is not None:
+        _atomic_json(args.out.expanduser().resolve(), receipt)
+    else:
+        print(json.dumps(receipt, indent=2, ensure_ascii=False))
+    return 0
+
+
 def _parse_env(values: list[str]) -> dict[str, str]:
     result: dict[str, str] = {}
     for value in values:
@@ -276,9 +312,12 @@ def _run(args: argparse.Namespace) -> int:
             kind = event.get("type")
             if kind == "accepted":
                 job_id = str(event["job_id"])
+                admission = event.get("admission_receipt") or {}
+                digest = admission.get("launch_spec_sha256")
+                suffix = f" admission={str(digest)[:12]}" if digest else ""
                 _note(
                     f"accepted job {event['job_id']} label={event['label']} "
-                    f"mode={event['mode']} gpus={event['gpu_count']}"
+                    f"mode={event['mode']} gpus={event['gpu_count']}{suffix}"
                 )
             elif kind == "queued":
                 message = (
@@ -289,6 +328,13 @@ def _run(args: argparse.Namespace) -> int:
                     message += f" probe_error={event['probe_error']}"
                 _note(message)
             elif kind == "started":
+                if args.receipt_out is not None:
+                    receipt = event.get("admission_receipt")
+                    if not isinstance(receipt, dict):
+                        raise RuntimeError(
+                            "broker did not provide the requested admission receipt"
+                        )
+                    _atomic_json(args.receipt_out.expanduser().resolve(), receipt)
                 _note(
                     "running on physical GPUs "
                     f"{','.join(map(str, event['gpu_ids']))} "
@@ -313,13 +359,28 @@ def _run(args: argparse.Namespace) -> int:
                 break
     except KeyboardInterrupt:
         return _interrupt_and_cancel(args.socket, job_id)
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, RuntimeError, json.JSONDecodeError) as exc:
         print(f"gpu-run: connection failed: {exc}", file=sys.stderr)
         return 1
     finally:
         connection.close()
         client.close()
     return exit_code
+
+
+def _atomic_json(path: Path, value: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(value, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+        os.replace(temporary, path)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
 
 
 def _interrupt_and_cancel(socket_path: Path, job_id: str | None) -> int:

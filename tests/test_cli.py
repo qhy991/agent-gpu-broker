@@ -4,6 +4,7 @@ import argparse
 import contextlib
 import io
 import json
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -92,6 +93,7 @@ class RunTests(unittest.TestCase):
             estimate=1.0,
             queue_timeout=None,
             run_timeout=2.0,
+            receipt_out=None,
         )
         stderr = io.StringIO()
         with patch("agent_gpu_broker.cli._request", side_effect=fake_request):
@@ -123,6 +125,7 @@ class RunTests(unittest.TestCase):
             estimate=1.0,
             queue_timeout=None,
             run_timeout=2.0,
+            receipt_out=None,
         )
         stderr = io.StringIO()
         with patch(
@@ -132,6 +135,69 @@ class RunTests(unittest.TestCase):
             with contextlib.redirect_stderr(stderr):
                 self.assertEqual(_run(args), 0)
         self.assertIn("possible_swallowed_failure", stderr.getvalue())
+
+    def test_started_admission_receipt_is_written_atomically(self):
+        receipt = {
+            "schema": "gpuq.admission-receipt.v1",
+            "job_id": "gpuq-test",
+            "launch_spec_sha256": "spec-sha",
+            "receipt_sha256": "receipt-sha",
+        }
+
+        class StartedConnection(ContextResource):
+            def __iter__(self):
+                return iter(
+                    [
+                        (
+                            json.dumps(
+                                {
+                                    "type": "accepted",
+                                    "job_id": "gpuq-test",
+                                    "label": "job",
+                                    "mode": "exclusive",
+                                    "gpu_count": 1,
+                                    "admission_receipt": receipt,
+                                }
+                            )
+                            + "\n"
+                        ).encode(),
+                        (
+                            json.dumps(
+                                {
+                                    "type": "started",
+                                    "gpu_ids": [0],
+                                    "run_timeout_s": 2,
+                                    "admission_receipt": receipt,
+                                }
+                            )
+                            + "\n"
+                        ).encode(),
+                        b'{"type":"finished","state":"completed","exit_code":0,"reason":null}\n',
+                    ]
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "admission.json"
+            args = argparse.Namespace(
+                argv=["true"],
+                env=[],
+                socket=Path("/tmp/test-gpuq.sock"),
+                cwd=Path.cwd(),
+                owner="test",
+                label="job",
+                mode="exclusive",
+                gpu_count=1,
+                estimate=1.0,
+                queue_timeout=None,
+                run_timeout=2.0,
+                receipt_out=output,
+            )
+            with patch(
+                "agent_gpu_broker.cli._request",
+                return_value=(ContextResource(), StartedConnection()),
+            ):
+                self.assertEqual(_run(args), 0)
+            self.assertEqual(json.loads(output.read_text()), receipt)
 
 
 class StatusTests(unittest.TestCase):

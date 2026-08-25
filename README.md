@@ -27,6 +27,9 @@ read-only projection containing:
 - `events.jsonl`: accepted, started, and terminal lifecycle events;
 - `jobs/<job-id>/`: request metadata, stdout/stderr logs, and result JSON.
 
+Each admitted job also has `jobs/<job-id>/admission.json`, a mode-0600
+broker-issued projection of the exact launch identity.
+
 ## Install
 
 No installation is required on a shared host. The repository launchers use the
@@ -114,6 +117,46 @@ start depends on that service report `eta=unknown` instead of a fabricated
 multi-month duration. A bounded job that runs past its declared estimate also
 makes dependent ETAs unknown; an overdue process is not treated as finishing
 immediately.
+
+## Broker-issued admission receipts
+
+A long-running evaluator can ask `gpu-run` to atomically save the receipt that
+the broker emits after process start:
+
+```bash
+gpu-run \
+  --label fibserve-campaign \
+  --mode exclusive \
+  --gpu-count 1 \
+  --estimate unknown \
+  --run-timeout 2h \
+  --receipt-out /path/to/fibserve-admission.json \
+  --env SERVICE_PORT=10000 \
+  -- /path/to/start-fibserve.sh
+```
+
+While the job is active, an independent controller can re-query the same
+receipt through the broker socket:
+
+```bash
+gpuq receipt gpuq-<job-id> --out /path/to/live-admission.json
+```
+
+Schema `gpuq.admission-receipt.v1` binds:
+
+- canonical launch-spec, argv, and explicit environment-override SHA-256;
+- cwd, owner, label, mode, GPU count, and timeouts;
+- resolved executable path plus file SHA-256;
+- broker version/instance and submit/start timestamps;
+- allocated physical GPU IDs;
+- SHA-256 of the complete effective child environment, including the
+  broker-owned `CUDA_VISIBLE_DEVICES`.
+
+The receipt exposes environment keys and digests, never environment values.
+The executable is fingerprinted at admission, rechecked immediately before
+spawn, and executed through the resolved path. Content/path drift fails before
+the command starts. Active receipt lookup closes when a job becomes terminal;
+the private job directory and terminal result retain the durable digests.
 
 Before a request enters the FIFO, the daemon checks that its own unprivileged
 identity can enter the working directory and execute the command. Rejected
