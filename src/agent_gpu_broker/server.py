@@ -116,10 +116,11 @@ class BrokerServer:
             if job_id is not None:
                 await self.broker.cancel(job_id, reason="client handler failed")
         finally:
-            writer.close()
             try:
+                writer.close()
                 await writer.wait_closed()
             except (BrokenPipeError, ConnectionResetError, OSError):
+                # The peer is already gone; nothing left to clean up.
                 pass
 
     async def _forward_events(

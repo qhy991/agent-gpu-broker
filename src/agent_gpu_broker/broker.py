@@ -365,11 +365,20 @@ class GpuBroker:
 
     async def _scheduler_loop(self) -> None:
         while True:
-            self._wakeup.clear()
-            self._expire_queued_jobs()
-            await self._schedule_jobs()
-            self._publish_queue(force=False)
-            self._write_status()
+            try:
+                self._wakeup.clear()
+                self._expire_queued_jobs()
+                await self._schedule_jobs()
+                self._publish_queue(force=False)
+                self._write_status()
+            except Exception:
+                # A crashed scheduler silently freezes the whole queue while
+                # the process keeps accepting jobs. Log and keep polling;
+                # _schedule_jobs already fails closed into _probe_error.
+                import traceback
+
+                traceback.print_exc()
+                self._probe_error = "scheduler iteration failed; see broker logs"
             try:
                 await asyncio.wait_for(
                     self._wakeup.wait(), timeout=self._poll_interval_s
