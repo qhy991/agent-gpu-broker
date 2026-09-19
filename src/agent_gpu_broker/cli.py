@@ -8,12 +8,14 @@ import getpass
 import json
 import os
 import signal
+import shlex
 import socket
 import sys
 from pathlib import Path
 from typing import Any
 
 from .broker import GpuBroker
+from .backends import make_backend
 from .server import BrokerServer
 
 DEFAULT_SOCKET = Path("/tmp/agent-gpu-broker.sock")
@@ -61,6 +63,10 @@ def _parser() -> argparse.ArgumentParser:
     serve.add_argument("--socket", type=Path, default=DEFAULT_SOCKET)
     serve.add_argument("--state-dir", type=Path, default=DEFAULT_STATE_DIR)
     serve.add_argument("--lock-dir", type=Path, default=DEFAULT_LOCK_DIR)
+    serve.add_argument("--backend", choices=("nvidia", "metal", "hygon"), default="nvidia")
+    serve.add_argument("--occupancy-scope", choices=("system", "cooperative"), default="system")
+    serve.add_argument("--hygon-library", default="/usr/local/hyhal/lib/librocm_smi64.so")
+    serve.add_argument("--probe-command", help="read-only device probe argv, shell quoting accepted; no shell execution")
     serve.add_argument("--gpus", help="comma-separated physical GPU indices")
     serve.add_argument("--shared-capacity", type=positive_int, default=2)
     serve.add_argument("--poll-interval", type=parse_duration, default=2.0)
@@ -122,6 +128,9 @@ async def _serve(args: argparse.Namespace) -> int:
         state_dir=args.state_dir.expanduser(),
         lock_dir=args.lock_dir,
         gpu_ids=gpu_ids,
+        backend=make_backend(args.backend, occupancy_scope=args.occupancy_scope,
+                             probe_command=shlex.split(args.probe_command) if args.probe_command else None,
+                             hygon_library=args.hygon_library),
         shared_capacity=args.shared_capacity,
         poll_interval_s=args.poll_interval,
         heartbeat_s=args.heartbeat,

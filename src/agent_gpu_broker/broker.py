@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__
+from .backends import DeviceBackend
 from .gpu import CardLock, GpuInventory, NvidiaSmiInventory, try_card_lock
 
 MODES = frozenset({"shared", "exclusive"})
@@ -186,6 +187,7 @@ class GpuBroker:
         state_dir: Path,
         lock_dir: Path,
         inventory: GpuInventory | None = None,
+        backend: DeviceBackend | None = None,
         gpu_ids: list[int] | None = None,
         shared_capacity: int = 2,
         poll_interval_s: float = 2.0,
@@ -196,7 +198,10 @@ class GpuBroker:
             raise ValueError("shared_capacity must be positive")
         self._store = StateStore(state_dir)
         self._lock_dir = lock_dir
-        self._inventory = inventory or NvidiaSmiInventory()
+        if backend is not None and inventory is not None:
+            raise ValueError("choose backend or inventory, not both")
+        self._backend = backend or DeviceBackend("nvidia", inventory or NvidiaSmiInventory())
+        self._inventory = self._backend.inventory
         self._configured_gpu_ids = list(gpu_ids) if gpu_ids is not None else None
         self._gpu_ids: list[int] = []
         self._shared_capacity = shared_capacity
@@ -226,7 +231,7 @@ class GpuBroker:
                 raise RuntimeError(f"configured GPUs not discovered: {missing}")
             self._gpu_ids = list(self._configured_gpu_ids)
         if not self._gpu_ids:
-            raise RuntimeError("no NVIDIA GPUs discovered or configured")
+            raise RuntimeError("no GPUs discovered or configured")
         if len(set(self._gpu_ids)) != len(self._gpu_ids):
             raise RuntimeError("configured GPU indices must be unique")
         self._scheduler = asyncio.create_task(
@@ -340,6 +345,9 @@ class GpuBroker:
         return {
             "version": 2,
             "broker_version": BROKER_VERSION,
+            "backend": self._backend.name,
+            "occupancy_scope": self._backend.occupancy_scope,
+            "external_occupancy": "unknown" if self._backend.occupancy_scope == "cooperative" or self._probe_error else "observed",
             "instance_id": self._instance_id,
             "updated_at": _utc_now(),
             "probe_error": self._probe_error,
@@ -521,11 +529,9 @@ class GpuBroker:
         exit_code = 1
         reason: str | None = None
         try:
-            environment = {
-                **os.environ,
-                **job.spec.env,
-                "CUDA_VISIBLE_DEVICES": ",".join(map(str, job.gpu_ids)),
-            }
+            environment = self._backend.environment(
+                {**os.environ, **job.spec.env}, job.gpu_ids
+            )
             job.process = await asyncio.create_subprocess_exec(
                 *job.spec.argv,
                 cwd=job.spec.cwd,
@@ -542,6 +548,8 @@ class GpuBroker:
                     "label": job.spec.label,
                     "mode": job.spec.mode,
                     "gpu_count": job.spec.gpu_count,
+                    "backend": self._backend.name,
+                    "occupancy_scope": self._backend.occupancy_scope,
                     "gpu_ids": list(job.gpu_ids),
                     "run_timeout_s": job.spec.run_timeout_s,
                 },
@@ -698,6 +706,9 @@ class GpuBroker:
             "wait_seconds": wait_s,
             "duration_seconds": duration_s,
             "broker_version": BROKER_VERSION,
+            "backend": self._backend.name,
+            "occupancy_scope": self._backend.occupancy_scope,
+            "external_occupancy": "unknown" if self._backend.occupancy_scope == "cooperative" or self._probe_error else "observed",
             "broker_instance_id": self._instance_id,
         }
         warning = self._swallowed_failure_warning(job, duration_s)
@@ -863,6 +874,8 @@ class GpuBroker:
             "label": job.spec.label,
             "mode": job.spec.mode,
             "gpu_count": job.spec.gpu_count,
+            "backend": self._backend.name,
+            "occupancy_scope": self._backend.occupancy_scope,
             "gpu_ids": list(job.gpu_ids),
             "submitted_at": job.submitted_at,
             "started_at": job.started_at,
@@ -898,6 +911,8 @@ class GpuBroker:
             "label": job.spec.label,
             "mode": job.spec.mode,
             "gpu_count": job.spec.gpu_count,
+            "backend": self._backend.name,
+            "occupancy_scope": self._backend.occupancy_scope,
             "gpu_ids": list(job.gpu_ids),
         }
         if result is not None:
