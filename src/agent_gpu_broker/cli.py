@@ -63,7 +63,7 @@ def _parser() -> argparse.ArgumentParser:
     serve.add_argument("--socket", type=Path, default=DEFAULT_SOCKET)
     serve.add_argument("--state-dir", type=Path, default=DEFAULT_STATE_DIR)
     serve.add_argument("--lock-dir", type=Path, default=DEFAULT_LOCK_DIR)
-    serve.add_argument("--backend", choices=("nvidia", "metal", "hygon"), default="nvidia")
+    serve.add_argument("--backend", choices=("nvidia", "metal", "hygon", "amd"), default="nvidia")
     serve.add_argument("--occupancy-scope", choices=("system", "cooperative"), default="system")
     serve.add_argument("--hygon-library", default="/usr/local/hyhal/lib/librocm_smi64.so")
     serve.add_argument("--probe-command", help="read-only device probe argv, shell quoting accepted; no shell execution")

@@ -57,11 +57,14 @@ class DeviceBackend:
                       GPUQ_OCCUPANCY_SCOPE=self.occupancy_scope)
         if self.name == "nvidia":
             result["CUDA_VISIBLE_DEVICES"] = selected
-        elif self.name == "hygon":
+        elif self.name in {"hygon", "amd"}:
             # HIP runtime ordinal namespace, supplied by the configured probe.
             result["HIP_VISIBLE_DEVICES"] = selected
-        elif gpu_ids != (0,) and gpu_ids != [0]:
-            raise RuntimeError("Metal backend supports only the single Apple GPU")
+        elif self.name == "metal":
+            if gpu_ids != (0,) and gpu_ids != [0]:
+                raise RuntimeError("Metal backend supports only the single Apple GPU")
+        else:
+            raise ValueError(f"unsupported GPU backend: {self.name}")
         return result
 
 
@@ -119,6 +122,10 @@ class MetalInventory:
 
 
 def make_backend(name, *, occupancy_scope="system", probe_command=None, hygon_library="/usr/local/hyhal/lib/librocm_smi64.so"):
+    if name == "amd":
+        if occupancy_scope != "system" or not probe_command:
+            raise ValueError("AMD requires a qualified --probe-command with system occupancy and HIP ordinals")
+        return DeviceBackend(name, CommandInventory(probe_command))
     if name == "nvidia":
         if occupancy_scope != "system" or probe_command:
             raise ValueError("NVIDIA uses its built-in system probe")

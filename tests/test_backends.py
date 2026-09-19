@@ -1,4 +1,5 @@
 import asyncio
+from dataclasses import replace
 import tempfile
 import unittest
 from pathlib import Path
@@ -12,7 +13,7 @@ from test_broker import FakeInventory, spec, terminal_events
 class BackendTests(unittest.IsolatedAsyncioTestCase):
     def test_backend_environment_cannot_be_overridden(self):
         inherited = {'HIP_VISIBLE_DEVICES': '9', 'CUDA_VISIBLE_DEVICES': '8', 'ROCR_VISIBLE_DEVICES': '7', 'GPUQ_BACKEND': 'wrong', 'PATH': '/bin'}
-        for name, key in [('nvidia', 'CUDA_VISIBLE_DEVICES'), ('hygon', 'HIP_VISIBLE_DEVICES')]:
+        for name, key in [('nvidia', 'CUDA_VISIBLE_DEVICES'), ('hygon', 'HIP_VISIBLE_DEVICES'), ('amd', 'HIP_VISIBLE_DEVICES')]:
             env = DeviceBackend(name, None).environment(inherited, (2,))
             self.assertEqual(env[key], '2')
             self.assertEqual(env['GPUQ_BACKEND'], name)
@@ -28,6 +29,29 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ValueError):
             make_backend('metal')
         self.assertEqual(make_backend('metal', occupancy_scope='cooperative').occupancy_scope, 'cooperative')
+
+    def test_amd_requires_its_own_qualified_probe(self):
+        with self.assertRaisesRegex(ValueError, 'qualified --probe-command'):
+            make_backend('amd')
+        backend = make_backend('amd', probe_command=['/site/amd-probe'])
+        self.assertEqual(backend.name, 'amd')
+        self.assertEqual(backend.inventory.command, ['/site/amd-probe'])
+        with self.assertRaisesRegex(ValueError, 'unsupported GPU backend'):
+            DeviceBackend('unknown', None).environment({}, (0,))
+
+    async def test_broker_overwrites_forged_allocation_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            broker = GpuBroker(state_dir=root/'state', lock_dir=root/'locks',
+                backend=DeviceBackend('amd', FakeInventory()), poll_interval_s=.01)
+            await broker.start()
+            try:
+                job = broker.submit(replace(spec("import os; assert os.environ['GPUQ_JOB_ID'].startswith('gpuq-'); assert os.environ['GPUQ_JOB_ID'] != 'forged'; assert os.environ['GPUQ_MODE'] == 'exclusive'; assert os.environ['GPUQ_BACKEND'] == 'amd'", label='amd-identity'),
+                    env={'GPUQ_JOB_ID': 'forged', 'GPUQ_MODE': 'shared'}))
+                events = await terminal_events(job)
+                self.assertEqual(events[-1]['state'], 'completed')
+            finally:
+                await broker.close()
 
     async def test_command_probe_rejects_unknown_and_drift(self):
         inventory = CommandInventory(['probe'])

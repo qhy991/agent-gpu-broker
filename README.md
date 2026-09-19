@@ -148,3 +148,16 @@ required:
 ```bash
 python -m unittest discover -s tests -v
 ```
+
+## Cake and AMD integration
+
+`gpuq serve --backend amd --probe-command '/absolute/qualified-amd-probe'`
+uses the existing queue with an explicit AMD backend. The probe must return the
+existing device-probe schema, complete system occupancy, and HIP runtime device
+ordinals. Missing observations refuse allocation; no Hygon probe is assumed.
+
+Child processes receive daemon-owned `GPUQ_JOB_ID` and `GPUQ_MODE` in addition to
+backend/device/scope facts; caller values cannot override them. Status declares
+`allocation_environment: gpuq_v1` for clients to check before spending work.
+CPU tests cover this protocol; real AMD probe and HIP mapping qualification is
+still required on the deployment host.

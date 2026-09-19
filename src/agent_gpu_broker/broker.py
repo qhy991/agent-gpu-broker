@@ -345,6 +345,7 @@ class GpuBroker:
         return {
             "version": 2,
             "broker_version": BROKER_VERSION,
+            "allocation_environment": "gpuq_v1",
             "backend": self._backend.name,
             "occupancy_scope": self._backend.occupancy_scope,
             "external_occupancy": "unknown" if self._backend.occupancy_scope == "cooperative" or self._probe_error else "observed",
@@ -532,6 +533,8 @@ class GpuBroker:
             environment = self._backend.environment(
                 {**os.environ, **job.spec.env}, job.gpu_ids
             )
+            # Allocation facts belong to the daemon, never caller-supplied env.
+            environment.update(GPUQ_JOB_ID=job.job_id, GPUQ_MODE=job.spec.mode)
             job.process = await asyncio.create_subprocess_exec(
                 *job.spec.argv,
                 cwd=job.spec.cwd,
