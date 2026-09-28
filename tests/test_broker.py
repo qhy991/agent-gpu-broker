@@ -55,6 +55,13 @@ async def terminal_events(job):
             return events
 
 
+async def await_started(job):
+    while True:
+        event = await asyncio.wait_for(job.events.get(), timeout=3)
+        if event["type"] == "started":
+            return
+
+
 class BrokerTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -194,9 +201,10 @@ class BrokerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_unknown_queued_estimate_only_hides_following_eta(self):
         first = self.broker.submit(
-            spec("import time; time.sleep(.12)", label="holder")
+            spec("import time; time.sleep(30)", label="holder",
+                 estimate_s=60, run_timeout_s=120)
         )
-        await asyncio.sleep(0.03)
+        await await_started(first)
         service = self.broker.submit(
             spec(
                 "import time; time.sleep(.05)",
@@ -208,11 +216,12 @@ class BrokerTests(unittest.IsolatedAsyncioTestCase):
         snapshot = self.broker.snapshot()
         self.assertIsNotNone(snapshot["queue"][0]["eta_seconds"])
         self.assertIsNone(snapshot["queue"][1]["eta_seconds"])
-        await asyncio.gather(
-            terminal_events(first),
-            terminal_events(service),
-            terminal_events(trailing),
-        )
+        self.assertTrue(await self.broker.cancel(first.job_id, reason="test release"))
+        first_events, service_events, trailing_events = await asyncio.gather(
+            terminal_events(first), terminal_events(service), terminal_events(trailing))
+        self.assertEqual(first_events[-1]["state"], "cancelled")
+        self.assertEqual(service_events[-1]["state"], "completed")
+        self.assertEqual(trailing_events[-1]["state"], "completed")
 
     async def test_two_shared_jobs_overlap_on_one_gpu(self):
         first = self.broker.submit(
@@ -352,26 +361,30 @@ class MultiGpuBrokerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_fifo_head_blocks_smaller_job(self):
         holder = self.broker.submit(
-            spec("import time; time.sleep(.15)", label="holder")
+            spec("import time; time.sleep(30)", label="holder", run_timeout_s=120)
         )
-        await asyncio.sleep(0.03)
+        await await_started(holder)
         two_card = self.broker.submit(
             spec("print('two')", label="two-card", gpu_count=2)
         )
         one_card = self.broker.submit(spec("print('one')", label="one-card"))
-        await asyncio.sleep(0.03)
-
         snapshot = self.broker.snapshot()
         self.assertEqual(
             [item["label"] for item in snapshot["queue"]],
             ["two-card", "one-card"],
         )
+        self.assertTrue(await self.broker.cancel(holder.job_id, reason="test release"))
         events = await asyncio.gather(
             terminal_events(holder),
             terminal_events(two_card),
             terminal_events(one_card),
         )
-        self.assertTrue(all(items[-1]["state"] == "completed" for items in events))
+        self.assertEqual([items[-1]["state"] for items in events],
+                         ["cancelled", "completed", "completed"])
+        self.assertLess(next(item["started_at"] for item in self.broker.snapshot()["recent"]
+                             if item["job_id"] == two_card.job_id),
+                        next(item["started_at"] for item in self.broker.snapshot()["recent"]
+                             if item["job_id"] == one_card.job_id))
 
 
 if __name__ == "__main__":
