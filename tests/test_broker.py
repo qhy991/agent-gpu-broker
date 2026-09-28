@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from agent_gpu_broker.broker import GpuBroker, JobSpec
@@ -139,6 +141,10 @@ class BrokerTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0.03)
         second = self.broker.submit(spec("print(1)", label="queued"))
         snapshot = self.broker.snapshot()
+        self.assertEqual(snapshot["allocation_environment"], "gpuq_v1")
+        self.assertEqual(snapshot["backend"], "nvidia")
+        self.assertEqual(snapshot["occupancy_scope"], "system")
+        self.assertEqual(snapshot["external_occupancy"], "observed")
         self.assertEqual(snapshot["running"][0]["label"], "running")
         self.assertEqual(snapshot["running"][0]["mode"], "exclusive")
         self.assertEqual(snapshot["running"][0]["gpu_ids"], [0])
@@ -304,7 +310,9 @@ class MultiGpuBrokerTests(unittest.IsolatedAsyncioTestCase):
     async def test_multi_gpu_allocation_is_atomic_and_visible(self):
         job = self.broker.submit(
             spec(
-                "import os; print(os.environ['CUDA_VISIBLE_DEVICES'])",
+                "import json, os; print(json.dumps({key: os.environ[key] for key in "
+                "('CUDA_VISIBLE_DEVICES', 'GPUQ_JOB_ID', 'GPUQ_MODE', "
+                "'GPUQ_BACKEND', 'GPUQ_DEVICE_IDS', 'GPUQ_OCCUPANCY_SCOPE')}))",
                 label="two-card",
                 gpu_count=2,
             )
@@ -315,7 +323,32 @@ class MultiGpuBrokerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(started["gpu_ids"], [0, 1])
         self.assertEqual(started["gpu_count"], 2)
         output = "".join(event["data"] for event in events if event["type"] == "output")
-        self.assertEqual(output.strip(), "0,1")
+        environment = json.loads(output)
+        self.assertEqual(environment, {
+            "CUDA_VISIBLE_DEVICES": "0,1", "GPUQ_JOB_ID": job.job_id,
+            "GPUQ_MODE": "exclusive", "GPUQ_BACKEND": "nvidia",
+            "GPUQ_DEVICE_IDS": "0,1", "GPUQ_OCCUPANCY_SCOPE": "system",
+        })
+
+    async def test_allocation_environment_overrides_caller_claims(self):
+        job = self.broker.submit(replace(
+            spec(
+                "import json, os; print(json.dumps({key: os.environ[key] for key in "
+                "('GPUQ_JOB_ID', 'GPUQ_MODE', 'GPUQ_BACKEND', 'GPUQ_DEVICE_IDS', "
+                "'GPUQ_OCCUPANCY_SCOPE', 'CUDA_VISIBLE_DEVICES')}))",
+                label="broker-owned-env", gpu_count=2,
+            ),
+            env={"GPUQ_JOB_ID": "forged", "GPUQ_MODE": "shared",
+                 "GPUQ_BACKEND": "other", "GPUQ_DEVICE_IDS": "9",
+                 "GPUQ_OCCUPANCY_SCOPE": "cooperative", "CUDA_VISIBLE_DEVICES": "9"},
+        ))
+        events = await terminal_events(job)
+        output = "".join(event["data"] for event in events if event["type"] == "output")
+        self.assertEqual(json.loads(output), {
+            "GPUQ_JOB_ID": job.job_id, "GPUQ_MODE": "exclusive",
+            "GPUQ_BACKEND": "nvidia", "GPUQ_DEVICE_IDS": "0,1",
+            "GPUQ_OCCUPANCY_SCOPE": "system", "CUDA_VISIBLE_DEVICES": "0,1",
+        })
 
     async def test_fifo_head_blocks_smaller_job(self):
         holder = self.broker.submit(
