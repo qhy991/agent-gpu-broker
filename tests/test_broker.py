@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from agent_gpu_broker.broker import GpuBroker, JobSpec
@@ -51,6 +53,13 @@ async def terminal_events(job):
         events.append(event)
         if event["type"] == "finished":
             return events
+
+
+async def await_started(job):
+    while True:
+        event = await asyncio.wait_for(job.events.get(), timeout=3)
+        if event["type"] == "started":
+            return
 
 
 class BrokerTests(unittest.IsolatedAsyncioTestCase):
@@ -139,6 +148,10 @@ class BrokerTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0.03)
         second = self.broker.submit(spec("print(1)", label="queued"))
         snapshot = self.broker.snapshot()
+        self.assertEqual(snapshot["allocation_environment"], "gpuq_v1")
+        self.assertEqual(snapshot["backend"], "nvidia")
+        self.assertEqual(snapshot["occupancy_scope"], "system")
+        self.assertEqual(snapshot["external_occupancy"], "observed")
         self.assertEqual(snapshot["running"][0]["label"], "running")
         self.assertEqual(snapshot["running"][0]["mode"], "exclusive")
         self.assertEqual(snapshot["running"][0]["gpu_ids"], [0])
@@ -188,9 +201,10 @@ class BrokerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_unknown_queued_estimate_only_hides_following_eta(self):
         first = self.broker.submit(
-            spec("import time; time.sleep(.12)", label="holder")
+            spec("import time; time.sleep(30)", label="holder",
+                 estimate_s=60, run_timeout_s=120)
         )
-        await asyncio.sleep(0.03)
+        await await_started(first)
         service = self.broker.submit(
             spec(
                 "import time; time.sleep(.05)",
@@ -202,11 +216,12 @@ class BrokerTests(unittest.IsolatedAsyncioTestCase):
         snapshot = self.broker.snapshot()
         self.assertIsNotNone(snapshot["queue"][0]["eta_seconds"])
         self.assertIsNone(snapshot["queue"][1]["eta_seconds"])
-        await asyncio.gather(
-            terminal_events(first),
-            terminal_events(service),
-            terminal_events(trailing),
-        )
+        self.assertTrue(await self.broker.cancel(first.job_id, reason="test release"))
+        first_events, service_events, trailing_events = await asyncio.gather(
+            terminal_events(first), terminal_events(service), terminal_events(trailing))
+        self.assertEqual(first_events[-1]["state"], "cancelled")
+        self.assertEqual(service_events[-1]["state"], "completed")
+        self.assertEqual(trailing_events[-1]["state"], "completed")
 
     async def test_two_shared_jobs_overlap_on_one_gpu(self):
         first = self.broker.submit(
@@ -304,7 +319,9 @@ class MultiGpuBrokerTests(unittest.IsolatedAsyncioTestCase):
     async def test_multi_gpu_allocation_is_atomic_and_visible(self):
         job = self.broker.submit(
             spec(
-                "import os; print(os.environ['CUDA_VISIBLE_DEVICES'])",
+                "import json, os; print(json.dumps({key: os.environ[key] for key in "
+                "('CUDA_VISIBLE_DEVICES', 'GPUQ_JOB_ID', 'GPUQ_MODE', "
+                "'GPUQ_BACKEND', 'GPUQ_DEVICE_IDS', 'GPUQ_OCCUPANCY_SCOPE')}))",
                 label="two-card",
                 gpu_count=2,
             )
@@ -315,30 +332,59 @@ class MultiGpuBrokerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(started["gpu_ids"], [0, 1])
         self.assertEqual(started["gpu_count"], 2)
         output = "".join(event["data"] for event in events if event["type"] == "output")
-        self.assertEqual(output.strip(), "0,1")
+        environment = json.loads(output)
+        self.assertEqual(environment, {
+            "CUDA_VISIBLE_DEVICES": "0,1", "GPUQ_JOB_ID": job.job_id,
+            "GPUQ_MODE": "exclusive", "GPUQ_BACKEND": "nvidia",
+            "GPUQ_DEVICE_IDS": "0,1", "GPUQ_OCCUPANCY_SCOPE": "system",
+        })
+
+    async def test_allocation_environment_overrides_caller_claims(self):
+        job = self.broker.submit(replace(
+            spec(
+                "import json, os; print(json.dumps({key: os.environ[key] for key in "
+                "('GPUQ_JOB_ID', 'GPUQ_MODE', 'GPUQ_BACKEND', 'GPUQ_DEVICE_IDS', "
+                "'GPUQ_OCCUPANCY_SCOPE', 'CUDA_VISIBLE_DEVICES')}))",
+                label="broker-owned-env", gpu_count=2,
+            ),
+            env={"GPUQ_JOB_ID": "forged", "GPUQ_MODE": "shared",
+                 "GPUQ_BACKEND": "other", "GPUQ_DEVICE_IDS": "9",
+                 "GPUQ_OCCUPANCY_SCOPE": "cooperative", "CUDA_VISIBLE_DEVICES": "9"},
+        ))
+        events = await terminal_events(job)
+        output = "".join(event["data"] for event in events if event["type"] == "output")
+        self.assertEqual(json.loads(output), {
+            "GPUQ_JOB_ID": job.job_id, "GPUQ_MODE": "exclusive",
+            "GPUQ_BACKEND": "nvidia", "GPUQ_DEVICE_IDS": "0,1",
+            "GPUQ_OCCUPANCY_SCOPE": "system", "CUDA_VISIBLE_DEVICES": "0,1",
+        })
 
     async def test_fifo_head_blocks_smaller_job(self):
         holder = self.broker.submit(
-            spec("import time; time.sleep(.15)", label="holder")
+            spec("import time; time.sleep(30)", label="holder", run_timeout_s=120)
         )
-        await asyncio.sleep(0.03)
+        await await_started(holder)
         two_card = self.broker.submit(
             spec("print('two')", label="two-card", gpu_count=2)
         )
         one_card = self.broker.submit(spec("print('one')", label="one-card"))
-        await asyncio.sleep(0.03)
-
         snapshot = self.broker.snapshot()
         self.assertEqual(
             [item["label"] for item in snapshot["queue"]],
             ["two-card", "one-card"],
         )
+        self.assertTrue(await self.broker.cancel(holder.job_id, reason="test release"))
         events = await asyncio.gather(
             terminal_events(holder),
             terminal_events(two_card),
             terminal_events(one_card),
         )
-        self.assertTrue(all(items[-1]["state"] == "completed" for items in events))
+        self.assertEqual([items[-1]["state"] for items in events],
+                         ["cancelled", "completed", "completed"])
+        self.assertLess(next(item["started_at"] for item in self.broker.snapshot()["recent"]
+                             if item["job_id"] == two_card.job_id),
+                        next(item["started_at"] for item in self.broker.snapshot()["recent"]
+                             if item["job_id"] == one_card.job_id))
 
 
 if __name__ == "__main__":

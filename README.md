@@ -12,6 +12,12 @@ local schedulers can use its per-card lock directory to avoid co-tenancy.
 
 The exact v0.6.0 A800/B200 admission-receipt qualification is recorded in
 [the qualification report](docs/v0.6.0-admission-receipt-qualification-2026-08-25.md).
+Version 0.6.1 additionally reports the NVIDIA `gpuq_v1` allocation environment
+in status. For every launched job, the broker overwrites caller-supplied
+`GPUQ_JOB_ID`, `GPUQ_MODE`, `GPUQ_BACKEND`, `GPUQ_DEVICE_IDS`,
+`GPUQ_OCCUPANCY_SCOPE`, and `CUDA_VISIBLE_DEVICES` with its own allocation.
+The status declaration applies to this NVIDIA broker; it does not qualify a
+different backend or a running v0.6.0 daemon.
 
 ## Architecture
 

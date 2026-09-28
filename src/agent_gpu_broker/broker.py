@@ -24,6 +24,9 @@ LAUNCH_SPEC_SCHEMA = "gpuq.launch-spec.v1"
 ADMISSION_RECEIPT_SCHEMA = "gpuq.admission-receipt.v1"
 
 BROKER_VERSION = __version__
+ALLOCATION_ENVIRONMENT = "gpuq_v1"
+BACKEND = "nvidia"
+OCCUPANCY_SCOPE = "system"
 
 # Jobs that exit this fast with a permission error in their stderr almost
 # always lost a race between admission and the workload's first file access
@@ -476,6 +479,10 @@ class GpuBroker:
         return {
             "version": 2,
             "broker_version": BROKER_VERSION,
+            "allocation_environment": ALLOCATION_ENVIRONMENT,
+            "backend": BACKEND,
+            "occupancy_scope": OCCUPANCY_SCOPE,
+            "external_occupancy": "unknown" if self._probe_error else "observed",
             "instance_id": self._instance_id,
             "updated_at": _utc_now(),
             "probe_error": self._probe_error,
@@ -679,6 +686,11 @@ class GpuBroker:
                 **os.environ,
                 **job.spec.env,
                 "CUDA_VISIBLE_DEVICES": ",".join(map(str, job.gpu_ids)),
+                "GPUQ_JOB_ID": job.job_id,
+                "GPUQ_MODE": job.spec.mode,
+                "GPUQ_BACKEND": BACKEND,
+                "GPUQ_DEVICE_IDS": ",".join(map(str, job.gpu_ids)),
+                "GPUQ_OCCUPANCY_SCOPE": OCCUPANCY_SCOPE,
             }
             job.effective_env_sha256 = digest_json(environment)
             self._store.record_admission(job)
