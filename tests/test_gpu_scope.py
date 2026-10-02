@@ -124,6 +124,52 @@ class GpuScopeTests(unittest.IsolatedAsyncioTestCase):
         writer.close()
         await writer.wait_closed()
 
+    async def test_legacy_operation_cannot_silently_drop_a_scope(self):
+        value = launch_spec_value(self.request((7,)))
+        value["op"] = "run"
+        reader, writer = await asyncio.open_unix_connection(self.socket)
+        writer.write((json.dumps(value) + "\n").encode())
+        await writer.drain()
+        response = json.loads(await asyncio.wait_for(reader.readline(), timeout=3))
+        self.assertEqual(response["type"], "error")
+        self.assertIn("run-scoped", response["message"])
+        self.assertEqual(self.broker.snapshot()["running"], [])
+        writer.close()
+        await writer.wait_closed()
+
+    async def test_new_client_fails_on_legacy_server_before_submitting_a_job(self):
+        requests = []
+
+        async def legacy_handler(reader, writer):
+            request = json.loads(await reader.readline())
+            requests.append(request)
+            # v0.6 rejects unknown operations before constructing a JobSpec;
+            # its ordinary run parser would ignore an unknown scope field.
+            writer.write((json.dumps({"type": "error", "message": "unknown operation"}) + "\n").encode())
+            await writer.drain()
+            writer.close()
+            await writer.wait_closed()
+
+        old_socket = self.root / "old.sock"
+        server = await asyncio.start_unix_server(legacy_handler, path=old_socket)
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                sys.executable, "-m", "agent_gpu_broker.cli", "run",
+                "--socket", str(old_socket), "--label", "downgrade",
+                "--mode", "exclusive", "--gpu-count", "1", "--allowed-gpus", "7",
+                "--", sys.executable, "-c", "print('must-not-run')",
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+            out, err = await asyncio.wait_for(proc.communicate(), timeout=5)
+            self.assertEqual(proc.returncode, 1)
+            self.assertEqual(out, b"")
+            self.assertIn(b"unknown operation", err)
+            self.assertEqual(len(requests), 1)
+            self.assertEqual(requests[0]["op"], "run-scoped")
+        finally:
+            server.close()
+            await server.wait_closed()
+
 
 class GpuScopeParsingTests(unittest.TestCase):
     def test_cli_rejects_empty_duplicate_or_negative_indices(self):

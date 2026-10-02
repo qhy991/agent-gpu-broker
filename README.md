@@ -19,6 +19,8 @@ or impossible scopes and never allocates outside them, including shared packing.
 The exact requested scope is bound into the launch identity and admission receipt.
 Requests omitting the option keep the managed-pool default. The candidate's CPU
 tests do not extend the historical v0.6 device qualification to v0.7.
+Scoped requests use `op=run-scoped` on the same FIFO submission path, so a v0.6
+server rejects them before admission instead of ignoring a new JSON field.
 
 ## Architecture
 

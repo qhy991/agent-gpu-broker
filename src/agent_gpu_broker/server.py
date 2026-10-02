@@ -10,6 +10,8 @@ from typing import Any
 
 from .broker import GpuBroker, JobSpec
 
+SCOPED_RUN_OPERATION = "run-scoped"
+
 
 class BrokerServer:
     def __init__(self, broker: GpuBroker, socket_path: Path) -> None:
@@ -83,8 +85,13 @@ class BrokerServer:
                     {"type": "receipt", "ok": receipt is not None, "receipt": receipt},
                 )
                 return
-            if operation != "run":
+            if operation not in {"run", SCOPED_RUN_OPERATION}:
                 raise ValueError(f"unknown operation: {operation!r}")
+            has_scope = request.get("allowed_gpu_ids") is not None
+            if operation == SCOPED_RUN_OPERATION and not has_scope:
+                raise ValueError("run-scoped requires allowed_gpu_ids")
+            if operation == "run" and has_scope:
+                raise ValueError("GPU-scoped requests require run-scoped")
 
             spec = self._parse_spec(request)
             job = self.broker.submit(spec)

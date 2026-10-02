@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from .broker import GpuBroker
-from .server import BrokerServer
+from .server import BrokerServer, SCOPED_RUN_OPERATION
 
 DEFAULT_SOCKET = Path("/tmp/agent-gpu-broker.sock")
 DEFAULT_STATE_DIR = Path.home() / ".local/share/agent-gpu-broker"
@@ -299,7 +299,7 @@ def _run(args: argparse.Namespace) -> int:
         client, connection = _request(
             args.socket,
             {
-                "op": "run",
+                "op": SCOPED_RUN_OPERATION if getattr(args, "allowed_gpus", None) is not None else "run",
                 "argv": command,
                 "cwd": str(args.cwd.expanduser().resolve()),
                 "owner": args.owner,
