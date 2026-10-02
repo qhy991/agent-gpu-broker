@@ -1,5 +1,10 @@
 # Agent GPU Broker
 
+0.7 新增可选 `gpuq run --allowed-gpus 0,1` 作业范围，编号来自站点允许的物理
+设备池。daemon 拒绝无效或无法满足的范围，独占与共享打包都不会分配范围外设备；
+准确范围绑定到启动身份和 admission 回执。不传此参数的旧请求保持受管理设备池
+默认行为。候选的 CPU 测试不能把历史 0.6 设备资格结论延伸到 0.7。
+
 简体中文 | [English](README.md)
 
 `agent-gpu-broker` 是一个面向编程 Agent 的单机全局 GPU 队列。Agent 只需保持

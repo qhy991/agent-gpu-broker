@@ -13,6 +13,13 @@ local schedulers can use its per-card lock directory to avoid co-tenancy.
 The exact v0.6.0 A800/B200 admission-receipt qualification is recorded in
 [the qualification report](docs/v0.6.0-admission-receipt-qualification-2026-08-25.md).
 
+Version 0.7 adds optional `gpuq run --allowed-gpus 0,1` job constraints. These
+are physical indices from the site's permitted pool; the daemon rejects invalid
+or impossible scopes and never allocates outside them, including shared packing.
+The exact requested scope is bound into the launch identity and admission receipt.
+Requests omitting the option keep the managed-pool default. The candidate's CPU
+tests do not extend the historical v0.6 device qualification to v0.7.
+
 ## Architecture
 
 ```text

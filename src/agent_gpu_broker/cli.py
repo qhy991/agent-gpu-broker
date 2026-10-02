@@ -54,6 +54,16 @@ def positive_int(value: str) -> int:
     return result
 
 
+def parse_gpu_ids(value: str) -> list[int]:
+    parts = value.split(",")
+    if not parts or any(not part.strip().isdigit() for part in parts):
+        raise argparse.ArgumentTypeError("allowed GPUs must be comma-separated physical indices")
+    result = [int(part.strip()) for part in parts]
+    if len(set(result)) != len(result):
+        raise argparse.ArgumentTypeError("allowed GPUs must be distinct")
+    return result
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="gpuq")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -99,6 +109,8 @@ def _parser() -> argparse.ArgumentParser:
         default=900.0,
     )
     run.add_argument("--env", action="append", default=[], metavar="KEY=VALUE")
+    run.add_argument("--allowed-gpus", type=parse_gpu_ids,
+                     help="restrict allocation to these managed physical GPU indices")
     run.add_argument(
         "--receipt-out",
         type=Path,
@@ -294,6 +306,7 @@ def _run(args: argparse.Namespace) -> int:
                 "label": args.label,
                 "mode": args.mode,
                 "gpu_count": args.gpu_count,
+                "allowed_gpu_ids": getattr(args, "allowed_gpus", None),
                 "estimate_s": args.estimate,
                 "queue_timeout_s": args.queue_timeout,
                 "run_timeout_s": args.run_timeout,

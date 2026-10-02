@@ -168,6 +168,9 @@ class BrokerServer:
         ):
             raise ValueError("gpu_count must be a positive integer")
         queue_timeout = request.get("queue_timeout_s")
+        allowed = request.get("allowed_gpu_ids")
+        if allowed is not None and not isinstance(allowed, list):
+            raise ValueError("allowed_gpu_ids must be a list")
         raw_estimate = request.get("estimate_s", 600.0)
         return JobSpec(
             argv=tuple(argv),
@@ -176,6 +179,7 @@ class BrokerServer:
             label=label.strip(),
             mode=mode,
             gpu_count=gpu_count,
+            allowed_gpu_ids=tuple(allowed) if allowed is not None else None,
             estimate_s=(
                 None
                 if raw_estimate is None

@@ -107,6 +107,7 @@ def launch_spec_value(spec: "JobSpec") -> dict[str, Any]:
         "label": spec.label,
         "mode": spec.mode,
         "gpu_count": spec.gpu_count,
+        "allowed_gpu_ids": list(spec.allowed_gpu_ids) if spec.allowed_gpu_ids is not None else None,
         "estimate_s": spec.estimate_s,
         "queue_timeout_s": spec.queue_timeout_s,
         "run_timeout_s": spec.run_timeout_s,
@@ -148,6 +149,7 @@ def _static_admission(job: "Job") -> dict[str, Any]:
         "label": job.spec.label,
         "mode": job.spec.mode,
         "gpu_count": job.spec.gpu_count,
+        "allowed_gpu_ids": list(job.spec.allowed_gpu_ids) if job.spec.allowed_gpu_ids is not None else None,
         "cwd": job.spec.cwd,
         "argv_count": len(job.spec.argv),
         "argv_sha256": digest_json(list(job.spec.argv)),
@@ -183,6 +185,7 @@ class JobSpec:
     run_timeout_s: float
     queue_timeout_s: float | None
     env: dict[str, str] = field(default_factory=dict)
+    allowed_gpu_ids: tuple[int, ...] | None = None
 
 
 @dataclass
@@ -397,6 +400,15 @@ class GpuBroker:
             raise ValueError(
                 f"gpu_count={spec.gpu_count} exceeds managed GPUs={len(self._gpu_ids)}"
             )
+        if spec.allowed_gpu_ids is not None:
+            allowed = spec.allowed_gpu_ids
+            if (not isinstance(allowed, tuple) or not allowed
+                    or any(not isinstance(gpu, int) or isinstance(gpu, bool) or gpu < 0
+                           or gpu not in self._gpu_ids for gpu in allowed)
+                    or len(set(allowed)) != len(allowed)):
+                raise ValueError("allowed_gpu_ids must be distinct managed physical GPU indices")
+            if spec.gpu_count > len(allowed):
+                raise ValueError("gpu_count exceeds allowed_gpu_ids")
         if spec.estimate_s is not None and spec.estimate_s <= 0:
             raise ValueError("estimate_s must be positive or unknown")
         job = Job(
@@ -564,16 +576,21 @@ class GpuBroker:
             self._start_job(job, gpu_ids)
         self._gpu_observation = self._observe_gpus(occupancy)
 
+    def _eligible_gpu_ids(self, spec: JobSpec) -> tuple[int, ...]:
+        return tuple(gpu for gpu in self._gpu_ids
+                     if spec.allowed_gpu_ids is None or gpu in spec.allowed_gpu_ids)
+
     def _try_allocate(
         self, job: Job, occupancy: dict[int, list[int]]
     ) -> tuple[int, ...] | None:
         selected: list[int] = []
+        eligible = self._eligible_gpu_ids(job.spec)
         if job.spec.mode == "shared":
             shared_cards = sorted(
                 (
                     gpu_id
                     for gpu_id, jobs in self._gpu_jobs.items()
-                    if jobs
+                    if gpu_id in eligible and jobs
                     and all(item.spec.mode == "shared" for item in jobs)
                     and len(jobs) < self._shared_capacity
                 ),
@@ -586,7 +603,7 @@ class GpuBroker:
         if needed:
             free_cards = [
                 gpu_id
-                for gpu_id in self._gpu_ids
+                for gpu_id in eligible
                 if gpu_id not in self._gpu_jobs
                 and gpu_id not in selected
                 and not occupancy.get(gpu_id, [])
@@ -922,6 +939,7 @@ class GpuBroker:
         result: dict[str, float | None] = {}
         queue = list(self._queue)
         for index, job in enumerate(queue):
+            eligible = self._eligible_gpu_ids(job.spec)
             if job.spec.gpu_count > len(virtual):
                 for blocked in queue[index:]:
                     result[blocked.job_id] = None
@@ -931,6 +949,7 @@ class GpuBroker:
                     (
                         (self._exclusive_ready_time(state), gpu_id)
                         for gpu_id, state in virtual.items()
+                        if gpu_id in eligible
                     ),
                     key=self._eta_sort_key,
                 )
@@ -946,6 +965,7 @@ class GpuBroker:
                     (
                         (self._shared_ready_time(state), gpu_id)
                         for gpu_id, state in virtual.items()
+                        if gpu_id in eligible
                     ),
                     key=self._eta_sort_key,
                 )
