@@ -74,6 +74,9 @@ class GpuScopeTests(unittest.IsolatedAsyncioTestCase):
         receipt = admission_receipt_value(job)
         self.assertEqual(receipt["allowed_gpu_ids"], [7, 1])
         self.assertEqual(receipt["broker_version"], __version__)
+        # Frozen B300-M3 NCU Hosts enforce this receipt-version predicate.
+        # Change the line only with an explicit consumer migration.
+        self.assertTrue(receipt["broker_version"].startswith("0.7."))
         self.assertIn("1", "".join(e.get("data", "") for e in events))
         self.assertNotEqual(launch_spec_value(self.request((1,))), launch_spec_value(self.request((7,))))
 
