@@ -162,6 +162,64 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         writer.close()
         await writer.wait_closed()
 
+    async def test_active_admission_receipt_is_queryable_and_terminal_closes(self):
+        reader, writer = await asyncio.open_unix_connection(self.socket_path)
+        await send(
+            writer,
+            {
+                "op": "run",
+                "argv": [sys.executable, "-c", "import time; time.sleep(30)"],
+                "cwd": str(Path.cwd()),
+                "owner": "agent-a",
+                "label": "receipt-service",
+                "mode": "exclusive",
+                "gpu_count": 1,
+                "estimate_s": None,
+                "run_timeout_s": 60,
+                "env": {"SERVICE_MODE": "test"},
+            },
+        )
+        job_id = None
+        started = None
+        while started is None:
+            event = await receive(reader)
+            if event["type"] == "accepted":
+                job_id = event["job_id"]
+            if event["type"] == "started":
+                started = event
+        self.assertIsNotNone(job_id)
+        self.assertIsInstance(started["admission_receipt"], dict)
+
+        receipt_reader, receipt_writer = await asyncio.open_unix_connection(
+            self.socket_path
+        )
+        await send(receipt_writer, {"op": "receipt", "job_id": job_id})
+        response = await receive(receipt_reader)
+        self.assertTrue(response["ok"])
+        self.assertEqual(
+            response["receipt"]["receipt_sha256"],
+            started["admission_receipt"]["receipt_sha256"],
+        )
+        receipt_writer.close()
+        await receipt_writer.wait_closed()
+
+        assert job_id is not None
+        self.assertTrue(await self.broker.cancel(job_id, reason="test cleanup"))
+        while (await receive(reader))["type"] != "finished":
+            pass
+        writer.close()
+        await writer.wait_closed()
+
+        closed_reader, closed_writer = await asyncio.open_unix_connection(
+            self.socket_path
+        )
+        await send(closed_writer, {"op": "receipt", "job_id": job_id})
+        closed = await receive(closed_reader)
+        self.assertFalse(closed["ok"])
+        self.assertIsNone(closed["receipt"])
+        closed_writer.close()
+        await closed_writer.wait_closed()
+
     async def test_running_disconnect_preserves_cancel_reason_and_releases_gpu(self):
         reader, writer = await asyncio.open_unix_connection(self.socket_path)
         await send(

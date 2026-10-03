@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import signal
@@ -16,9 +17,11 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__
-from .gpu import CardLock, GpuInventory, NvidiaSmiInventory, try_card_lock
+from .gpu import GPU_PROBE_TIMEOUT_S, CardLock, GpuInventory, NvidiaSmiInventory, try_card_lock
 
 MODES = frozenset({"shared", "exclusive"})
+LAUNCH_SPEC_SCHEMA = "gpuq.launch-spec.v1"
+ADMISSION_RECEIPT_SCHEMA = "gpuq.admission-receipt.v1"
 
 BROKER_VERSION = __version__
 
@@ -54,18 +57,9 @@ def _preflight_error(spec: "JobSpec") -> str | None:
         return f"preflight: cwd not accessible to broker identity: {cwd}"
 
     executable = spec.argv[0]
-    environment = {**os.environ, **spec.env}
-    if "/" in executable:
-        candidate = Path(executable)
-        if not candidate.is_absolute():
-            candidate = cwd / candidate
-        if not candidate.is_file() or not os.access(candidate, os.X_OK):
+    if _resolve_executable(spec) is None:
+        if "/" in executable:
             return f"preflight: executable not accessible: {executable}"
-    elif _resolve_on_path(
-        executable,
-        search_path=environment.get("PATH", os.defpath),
-        cwd=cwd,
-    ) is None:
         return f"preflight: executable not found on PATH: {executable}"
     return None
 
@@ -85,6 +79,100 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def canonical_json(value: Any) -> bytes:
+    return json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+
+
+def digest_json(value: Any) -> str:
+    return hashlib.sha256(canonical_json(value)).hexdigest()
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def launch_spec_value(spec: "JobSpec") -> dict[str, Any]:
+    """Canonical client-controlled launch and scheduling request."""
+    return {
+        "schema": LAUNCH_SPEC_SCHEMA,
+        "argv": list(spec.argv),
+        "cwd": spec.cwd,
+        "owner": spec.owner,
+        "label": spec.label,
+        "mode": spec.mode,
+        "gpu_count": spec.gpu_count,
+        "allowed_gpu_ids": list(spec.allowed_gpu_ids) if spec.allowed_gpu_ids is not None else None,
+        "estimate_s": spec.estimate_s,
+        "queue_timeout_s": spec.queue_timeout_s,
+        "run_timeout_s": spec.run_timeout_s,
+        "env": dict(spec.env),
+    }
+
+
+def _resolve_executable(spec: "JobSpec") -> Path | None:
+    cwd = Path(spec.cwd)
+    executable = spec.argv[0]
+    environment = {**os.environ, **spec.env}
+    if "/" in executable:
+        candidate = Path(executable)
+        if not candidate.is_absolute():
+            candidate = cwd / candidate
+        if not candidate.is_file() or not os.access(candidate, os.X_OK):
+            return None
+        return candidate.resolve()
+    resolved = _resolve_on_path(
+        executable,
+        search_path=environment.get("PATH", os.defpath),
+        cwd=cwd,
+    )
+    return Path(resolved).resolve() if resolved is not None else None
+
+
+def _static_admission(job: "Job") -> dict[str, Any]:
+    executable = _resolve_executable(job.spec)
+    if executable is None:
+        raise RuntimeError("cannot build admission identity for missing executable")
+    launch_spec = launch_spec_value(job.spec)
+    return {
+        "schema": ADMISSION_RECEIPT_SCHEMA,
+        "job_id": job.job_id,
+        "broker_version": BROKER_VERSION,
+        "broker_instance_id": job.broker_instance_id,
+        "submitted_at": job.submitted_at,
+        "owner": job.spec.owner,
+        "label": job.spec.label,
+        "mode": job.spec.mode,
+        "gpu_count": job.spec.gpu_count,
+        "allowed_gpu_ids": list(job.spec.allowed_gpu_ids) if job.spec.allowed_gpu_ids is not None else None,
+        "cwd": job.spec.cwd,
+        "argv_count": len(job.spec.argv),
+        "argv_sha256": digest_json(list(job.spec.argv)),
+        "env_keys": sorted(job.spec.env),
+        "env_sha256": digest_json(dict(job.spec.env)),
+        "launch_spec_sha256": digest_json(launch_spec),
+        "resolved_executable": str(executable),
+        "executable_sha256": _sha256_file(executable),
+    }
+
+
+def admission_receipt_value(job: "Job") -> dict[str, Any] | None:
+    if job.admission is None:
+        return None
+    value = {
+        **job.admission,
+        "started_at": job.started_at,
+        "gpu_ids": list(job.gpu_ids),
+        "effective_env_sha256": job.effective_env_sha256,
+    }
+    return {**value, "receipt_sha256": digest_json(value)}
+
+
 @dataclass(frozen=True)
 class JobSpec:
     argv: tuple[str, ...]
@@ -97,6 +185,7 @@ class JobSpec:
     run_timeout_s: float
     queue_timeout_s: float | None
     env: dict[str, str] = field(default_factory=dict)
+    allowed_gpu_ids: tuple[int, ...] | None = None
 
 
 @dataclass
@@ -106,6 +195,9 @@ class Job:
     events: asyncio.Queue[dict[str, Any]]
     submitted_at: str
     submitted_mono: float
+    broker_instance_id: str
+    admission: dict[str, Any] | None = None
+    effective_env_sha256: str | None = None
     state: str = "queued"
     gpu_ids: tuple[int, ...] = ()
     started_at: str | None = None
@@ -159,9 +251,43 @@ class StateStore:
                 "estimate_s": job.spec.estimate_s,
                 "run_timeout_s": job.spec.run_timeout_s,
                 "queue_timeout_s": job.spec.queue_timeout_s,
+                "admission_launch_spec_sha256": (
+                    job.admission.get("launch_spec_sha256")
+                    if job.admission is not None
+                    else None
+                ),
+                "admission_argv_sha256": (
+                    job.admission.get("argv_sha256")
+                    if job.admission is not None
+                    else None
+                ),
+                "admission_env_sha256": (
+                    job.admission.get("env_sha256")
+                    if job.admission is not None
+                    else None
+                ),
+                "admission_resolved_executable": (
+                    job.admission.get("resolved_executable")
+                    if job.admission is not None
+                    else None
+                ),
+                "admission_executable_sha256": (
+                    job.admission.get("executable_sha256")
+                    if job.admission is not None
+                    else None
+                ),
             },
             mode=0o600,
         )
+
+    def record_admission(self, job: Job) -> None:
+        receipt = admission_receipt_value(job)
+        if receipt is not None:
+            self._atomic_json(
+                self.jobs_dir / job.job_id / "admission.json",
+                receipt,
+                mode=0o600,
+            )
 
     def append_output(self, job_id: str, stream: str, data: bytes) -> None:
         path = self.jobs_dir / job_id / f"{stream}.log"
@@ -211,6 +337,8 @@ class GpuBroker:
         self._recent: deque[dict[str, Any]] = deque(maxlen=20)
         self._gpu_observation: dict[int, dict[str, Any]] = {}
         self._probe_error: str | None = None
+        self._gpu_observed_at: str | None = None
+        self._gpu_observed_mono: float | None = None
         self._instance_id = _instance_id()
         self._wakeup = asyncio.Event()
         self._scheduler: asyncio.Task[None] | None = None
@@ -240,6 +368,10 @@ class GpuBroker:
             return
         self._closed = True
         if self._scheduler is not None:
+            # Wake an Event.wait nested under wait_for before cancellation.
+            # This avoids a Python 3.9 cancellation race that can leave the
+            # scheduler gather pending during shutdown.
+            self._wakeup.set()
             self._scheduler.cancel()
             await asyncio.gather(self._scheduler, return_exceptions=True)
         for job_id in list(self._jobs):
@@ -270,6 +402,15 @@ class GpuBroker:
             raise ValueError(
                 f"gpu_count={spec.gpu_count} exceeds managed GPUs={len(self._gpu_ids)}"
             )
+        if spec.allowed_gpu_ids is not None:
+            allowed = spec.allowed_gpu_ids
+            if (not isinstance(allowed, tuple) or not allowed
+                    or any(not isinstance(gpu, int) or isinstance(gpu, bool) or gpu < 0
+                           or gpu not in self._gpu_ids for gpu in allowed)
+                    or len(set(allowed)) != len(allowed)):
+                raise ValueError("allowed_gpu_ids must be distinct managed physical GPU indices")
+            if spec.gpu_count > len(allowed):
+                raise ValueError("gpu_count exceeds allowed_gpu_ids")
         if spec.estimate_s is not None and spec.estimate_s <= 0:
             raise ValueError("estimate_s must be positive or unknown")
         job = Job(
@@ -278,9 +419,18 @@ class GpuBroker:
             events=asyncio.Queue(),
             submitted_at=_utc_now(),
             submitted_mono=time.monotonic(),
+            broker_instance_id=self._instance_id,
         )
         self._jobs[job.job_id] = job
+        preflight = _preflight_error(job.spec)
+        if preflight is None:
+            try:
+                job.admission = _static_admission(job)
+            except (OSError, RuntimeError) as exc:
+                preflight = f"preflight: cannot fingerprint launch identity: {exc}"
         self._store.record_request(job)
+        self._store.record_admission(job)
+        receipt = admission_receipt_value(job)
         self._emit(
             job,
             {
@@ -289,10 +439,10 @@ class GpuBroker:
                 "label": job.spec.label,
                 "mode": job.spec.mode,
                 "gpu_count": job.spec.gpu_count,
+                "admission_receipt": receipt,
             },
         )
         self._record_lifecycle(job, "accepted")
-        preflight = _preflight_error(job.spec)
         if preflight is not None:
             self._record_lifecycle(job, "preflight_rejected")
             self._finish(job, state="failed", exit_code=127, reason=preflight)
@@ -342,7 +492,12 @@ class GpuBroker:
             "broker_version": BROKER_VERSION,
             "instance_id": self._instance_id,
             "updated_at": _utc_now(),
-            "probe_error": self._probe_error,
+            "probe_error": self._observation_error(now),
+            "gpu_observed_at": self._gpu_observed_at,
+            "gpu_observation_age_seconds": (
+                max(0.0, now - self._gpu_observed_mono)
+                if self._gpu_observed_mono is not None else None
+            ),
             "shared_capacity": self._shared_capacity,
             "gpus": [
                 {
@@ -363,28 +518,59 @@ class GpuBroker:
             "recent": list(self._recent),
         }
 
+    def admission_receipt(self, job_id: str) -> dict[str, Any] | None:
+        job = self._jobs.get(job_id)
+        return admission_receipt_value(job) if job is not None else None
+
     async def _scheduler_loop(self) -> None:
-        while True:
+        while not self._closed:
             try:
                 self._wakeup.clear()
                 self._expire_queued_jobs()
                 await self._schedule_jobs()
                 self._publish_queue(force=False)
                 self._write_status()
-            except Exception:
-                # A crashed scheduler silently freezes the whole queue while
-                # the process keeps accepting jobs. Log and keep polling;
-                # _schedule_jobs already fails closed into _probe_error.
+            except Exception as exc:
+                # Preserve the loop after one bad probe, observation or write.
+                # Cancellation remains a shutdown request, not a retry.
                 import traceback
 
                 traceback.print_exc()
-                self._probe_error = "scheduler iteration failed; see broker logs"
-            try:
-                await asyncio.wait_for(
-                    self._wakeup.wait(), timeout=self._poll_interval_s
+                self._mark_gpu_unavailable(
+                    f"scheduler iteration failed: {type(exc).__name__}: {exc}"
                 )
-            except asyncio.TimeoutError:
-                pass
+            wake = asyncio.create_task(
+                self._wakeup.wait(), name="gpuq-scheduler-wakeup"
+            )
+            poll = asyncio.create_task(
+                asyncio.sleep(self._poll_interval_s), name="gpuq-scheduler-poll"
+            )
+            waiters = {wake, poll}
+            try:
+                await asyncio.wait(waiters, return_when=asyncio.FIRST_COMPLETED)
+            finally:
+                for waiter in waiters:
+                    if not waiter.done():
+                        waiter.cancel()
+                await asyncio.gather(*waiters, return_exceptions=True)
+
+    def _mark_gpu_unavailable(self, reason: str) -> None:
+        self._probe_error = reason
+        self._gpu_observation = {
+            gpu_id: {"state": "unavailable", "reason": reason}
+            for gpu_id in self._gpu_ids
+        }
+
+    def _observation_error(self, now: float) -> str | None:
+        if self._probe_error:
+            return self._probe_error
+        if self._gpu_observed_mono is None:
+            return "GPU occupancy has not been observed"
+        # One bounded probe plus two ordinary polling intervals. Reading status
+        # cannot refresh this clock or hide a stopped scheduler.
+        if now - self._gpu_observed_mono > GPU_PROBE_TIMEOUT_S + 2 * self._poll_interval_s:
+            return "GPU occupancy observation is stale"
+        return None
 
     def _expire_queued_jobs(self) -> None:
         now = time.monotonic()
@@ -406,11 +592,7 @@ class GpuBroker:
         try:
             occupancy = await self._inventory.compute_pids()
         except Exception as exc:  # fail closed when cleanliness is unknown
-            self._probe_error = str(exc)
-            self._gpu_observation = {
-                gpu_id: {"state": "unavailable", "reason": self._probe_error}
-                for gpu_id in self._gpu_ids
-            }
+            self._mark_gpu_unavailable(str(exc))
             return
 
         self._probe_error = None
@@ -422,17 +604,24 @@ class GpuBroker:
             self._queue.popleft()
             self._start_job(job, gpu_ids)
         self._gpu_observation = self._observe_gpus(occupancy)
+        self._gpu_observed_at = _utc_now()
+        self._gpu_observed_mono = time.monotonic()
+
+    def _eligible_gpu_ids(self, spec: JobSpec) -> tuple[int, ...]:
+        return tuple(gpu for gpu in self._gpu_ids
+                     if spec.allowed_gpu_ids is None or gpu in spec.allowed_gpu_ids)
 
     def _try_allocate(
         self, job: Job, occupancy: dict[int, list[int]]
     ) -> tuple[int, ...] | None:
         selected: list[int] = []
+        eligible = self._eligible_gpu_ids(job.spec)
         if job.spec.mode == "shared":
             shared_cards = sorted(
                 (
                     gpu_id
                     for gpu_id, jobs in self._gpu_jobs.items()
-                    if jobs
+                    if gpu_id in eligible and jobs
                     and all(item.spec.mode == "shared" for item in jobs)
                     and len(jobs) < self._shared_capacity
                 ),
@@ -445,7 +634,7 @@ class GpuBroker:
         if needed:
             free_cards = [
                 gpu_id
-                for gpu_id in self._gpu_ids
+                for gpu_id in eligible
                 if gpu_id not in self._gpu_jobs
                 and gpu_id not in selected
                 and not occupancy.get(gpu_id, [])
@@ -475,6 +664,7 @@ class GpuBroker:
         self._running_jobs[job.job_id] = job
         for gpu_id in gpu_ids:
             self._gpu_jobs.setdefault(gpu_id, []).append(job)
+        self._store.record_admission(job)
         job.task = asyncio.create_task(
             self._execute(job), name=f"gpuq-run-{job.job_id}"
         )
@@ -521,19 +711,45 @@ class GpuBroker:
         exit_code = 1
         reason: str | None = None
         try:
+            assert job.admission is not None
+            executable = _resolve_executable(job.spec)
+            if executable is None:
+                raise RuntimeError("admission drift: executable is no longer available")
+            executable_sha256 = _sha256_file(executable)
+            if (
+                str(executable) != job.admission["resolved_executable"]
+                or executable_sha256 != job.admission["executable_sha256"]
+            ):
+                raise RuntimeError(
+                    "admission drift: executable path or content changed before start"
+                )
             environment = {
                 **os.environ,
                 **job.spec.env,
                 "CUDA_VISIBLE_DEVICES": ",".join(map(str, job.gpu_ids)),
             }
-            job.process = await asyncio.create_subprocess_exec(
-                *job.spec.argv,
-                cwd=job.spec.cwd,
-                env=environment,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                start_new_session=True,
+            job.effective_env_sha256 = digest_json(environment)
+            self._store.record_admission(job)
+            spawn = asyncio.create_task(
+                asyncio.create_subprocess_exec(
+                    *job.spec.argv,
+                    executable=str(executable),
+                    cwd=job.spec.cwd,
+                    env=environment,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    start_new_session=True,
+                ),
+                name=f"gpuq-spawn-{job.job_id}",
             )
+            try:
+                job.process = await asyncio.shield(spawn)
+            except asyncio.CancelledError:
+                # create_subprocess_exec can be cancelled after fork but before
+                # returning the Process handle. Finish the shielded spawn so
+                # the outer cancellation path can terminate and reap it.
+                job.process = await spawn
+                raise
             self._emit(
                 job,
                 {
@@ -544,6 +760,7 @@ class GpuBroker:
                     "gpu_count": job.spec.gpu_count,
                     "gpu_ids": list(job.gpu_ids),
                     "run_timeout_s": job.spec.run_timeout_s,
+                    "admission_receipt": admission_receipt_value(job),
                 },
             )
             self._record_lifecycle(job, "started")
@@ -700,6 +917,12 @@ class GpuBroker:
             "broker_version": BROKER_VERSION,
             "broker_instance_id": self._instance_id,
         }
+        admission = admission_receipt_value(job)
+        if admission is not None:
+            result["admission_launch_spec_sha256"] = admission[
+                "launch_spec_sha256"
+            ]
+            result["admission_receipt_sha256"] = admission["receipt_sha256"]
         warning = self._swallowed_failure_warning(job, duration_s)
         if warning is not None:
             result["warning"] = warning
@@ -712,6 +935,8 @@ class GpuBroker:
         self._write_status()
 
     def _queue_eta(self, now: float) -> dict[str, float | None]:
+        if self._observation_error(now):
+            return {job.job_id: None for job in self._queue}
         available_ids = [
             gpu_id
             for gpu_id in self._gpu_ids
@@ -746,8 +971,10 @@ class GpuBroker:
 
         result: dict[str, float | None] = {}
         queue = list(self._queue)
+        fifo_start: float | None = 0.0
         for index, job in enumerate(queue):
-            if job.spec.gpu_count > len(virtual):
+            eligible = self._eligible_gpu_ids(job.spec)
+            if job.spec.gpu_count > sum(gpu_id in eligible for gpu_id in virtual):
                 for blocked in queue[index:]:
                     result[blocked.job_id] = None
                 break
@@ -756,11 +983,12 @@ class GpuBroker:
                     (
                         (self._exclusive_ready_time(state), gpu_id)
                         for gpu_id, state in virtual.items()
+                        if gpu_id in eligible
                     ),
                     key=self._eta_sort_key,
                 )
                 selected = ready[: job.spec.gpu_count]
-                start = self._latest_eta(*(item[0] for item in selected))
+                start = self._latest_eta(fifo_start, *(item[0] for item in selected))
                 for _, gpu_id in selected:
                     virtual[gpu_id]["exclusive_until"] = self._eta_end(
                         start, job.spec.estimate_s
@@ -771,11 +999,12 @@ class GpuBroker:
                     (
                         (self._shared_ready_time(state), gpu_id)
                         for gpu_id, state in virtual.items()
+                        if gpu_id in eligible
                     ),
                     key=self._eta_sort_key,
                 )
                 selected = ready[: job.spec.gpu_count]
-                start = self._latest_eta(*(item[0] for item in selected))
+                start = self._latest_eta(fifo_start, *(item[0] for item in selected))
                 for _, gpu_id in selected:
                     state = virtual[gpu_id]
                     if start is not None:
@@ -788,6 +1017,7 @@ class GpuBroker:
                         self._eta_end(start, job.spec.estimate_s)
                     )
             result[job.job_id] = start
+            fifo_start = start
         return result
 
     @staticmethod
@@ -856,7 +1086,7 @@ class GpuBroker:
 
     def _public_job(self, job: Job, now: float) -> dict[str, Any]:
         wait_end = job.started_mono if job.started_mono is not None else now
-        return {
+        value = {
             "job_id": job.job_id,
             "state": job.state,
             "owner": job.spec.owner,
@@ -864,6 +1094,9 @@ class GpuBroker:
             "mode": job.spec.mode,
             "gpu_count": job.spec.gpu_count,
             "gpu_ids": list(job.gpu_ids),
+            "allowed_gpu_ids": (
+                list(job.spec.allowed_gpu_ids) if job.spec.allowed_gpu_ids is not None else None
+            ),
             "submitted_at": job.submitted_at,
             "started_at": job.started_at,
             "wait_seconds": max(0.0, wait_end - job.submitted_mono),
@@ -874,15 +1107,29 @@ class GpuBroker:
             ),
             "estimate_seconds": job.spec.estimate_s,
         }
+        receipt = admission_receipt_value(job)
+        if receipt is not None:
+            value["admission_launch_spec_sha256"] = receipt[
+                "launch_spec_sha256"
+            ]
+            value["admission_receipt_sha256"] = receipt["receipt_sha256"]
+        return value
 
     @staticmethod
     def _job_brief(job: Job) -> dict[str, Any]:
-        return {
+        value = {
             "job_id": job.job_id,
             "owner": job.spec.owner,
             "label": job.spec.label,
             "mode": job.spec.mode,
         }
+        receipt = admission_receipt_value(job)
+        if receipt is not None:
+            value["admission_launch_spec_sha256"] = receipt[
+                "launch_spec_sha256"
+            ]
+            value["admission_receipt_sha256"] = receipt["receipt_sha256"]
+        return value
 
     def _emit(self, job: Job, event: dict[str, Any]) -> None:
         job.events.put_nowait(event)
@@ -900,6 +1147,12 @@ class GpuBroker:
             "gpu_count": job.spec.gpu_count,
             "gpu_ids": list(job.gpu_ids),
         }
+        receipt = admission_receipt_value(job)
+        if receipt is not None:
+            value["admission_launch_spec_sha256"] = receipt[
+                "launch_spec_sha256"
+            ]
+            value["admission_receipt_sha256"] = receipt["receipt_sha256"]
         if result is not None:
             value.update(
                 {key: result[key] for key in ("exit_code", "reason") if key in result}

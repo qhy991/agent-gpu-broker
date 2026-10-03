@@ -10,6 +10,9 @@ from pathlib import Path
 from typing import Protocol
 
 
+GPU_PROBE_TIMEOUT_S = 10.0
+
+
 class GpuInventory(Protocol):
     async def gpu_ids(self) -> list[int]: ...
 
@@ -23,7 +26,20 @@ async def _nvidia_smi(*args: str) -> str:
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    stdout, stderr = await proc.communicate()
+    try:
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(), timeout=GPU_PROBE_TIMEOUT_S
+        )
+    except (asyncio.TimeoutError, asyncio.CancelledError) as exc:
+        if proc.returncode is None:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+        await proc.communicate()
+        if isinstance(exc, asyncio.CancelledError):
+            raise
+        raise RuntimeError(f"nvidia-smi timed out after {GPU_PROBE_TIMEOUT_S:g}s") from exc
     if proc.returncode != 0:
         detail = stderr.decode("utf-8", "replace").strip()
         raise RuntimeError(f"nvidia-smi failed ({proc.returncode}): {detail}")

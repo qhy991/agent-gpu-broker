@@ -5,6 +5,7 @@ CPU subprocesses; no GPU is required."""
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import sys
 import tempfile
@@ -12,7 +13,13 @@ import unittest
 from pathlib import Path
 
 from agent_gpu_broker import __version__
-from agent_gpu_broker.broker import GpuBroker, JobSpec
+from agent_gpu_broker.broker import (
+    ADMISSION_RECEIPT_SCHEMA,
+    GpuBroker,
+    JobSpec,
+    digest_json,
+    launch_spec_value,
+)
 
 
 class FakeInventory:
@@ -59,6 +66,7 @@ class HardeningTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.temp = tempfile.TemporaryDirectory()
         root = Path(self.temp.name)
+        self.root = root
         self.broker = GpuBroker(
             state_dir=root / "state",
             lock_dir=root / "locks",
@@ -215,6 +223,71 @@ class HardeningTests(unittest.IsolatedAsyncioTestCase):
         event = await terminal_event(self.broker.submit(job))
         self.assertEqual(event["state"], "completed")
         self.assertNotIn("warning", event)
+
+    async def test_admission_receipt_binds_launch_without_exposing_values(self):
+        secret = "high-entropy-test-secret"
+        job = self.broker.submit(
+            spec(
+                (sys.executable, "-c", "import time; time.sleep(30)"),
+                label="receipt-holder",
+                env={"KERNEL_MODE": "service", "SECRET_TOKEN": secret},
+            )
+        )
+        while True:
+            event = await asyncio.wait_for(job.events.get(), timeout=2)
+            if event["type"] == "started":
+                break
+        receipt = self.broker.admission_receipt(job.job_id)
+        self.assertIsNotNone(receipt)
+        assert receipt is not None
+        self.assertEqual(receipt["schema"], ADMISSION_RECEIPT_SCHEMA)
+        self.assertEqual(
+            receipt["launch_spec_sha256"], digest_json(launch_spec_value(job.spec))
+        )
+        self.assertEqual(receipt["env_sha256"], digest_json(job.spec.env))
+        self.assertEqual(receipt["env_keys"], ["KERNEL_MODE", "SECRET_TOKEN"])
+        self.assertTrue(receipt["effective_env_sha256"])
+        self.assertNotIn(secret, json.dumps(receipt, sort_keys=True))
+        persisted = json.loads(
+            (
+                self.root / "state" / "jobs" / job.job_id / "admission.json"
+            ).read_text()
+        )
+        self.assertEqual(persisted, receipt)
+        running = self.broker.snapshot()["running"][0]
+        self.assertEqual(
+            running["admission_launch_spec_sha256"],
+            receipt["launch_spec_sha256"],
+        )
+        self.assertEqual(
+            running["admission_receipt_sha256"], receipt["receipt_sha256"]
+        )
+        self.assertTrue(await self.broker.cancel(job.job_id, reason="test cleanup"))
+
+    async def test_executable_content_drift_fails_before_launch(self):
+        holder = self.broker.submit(
+            spec(
+                (sys.executable, "-c", "import time; time.sleep(30)"),
+                label="drift-holder",
+            )
+        )
+        while (await asyncio.wait_for(holder.events.get(), timeout=2))["type"] != "started":
+            pass
+
+        executable = self.root / "probe"
+        marker = self.root / "ran"
+        executable.write_text(f"#!/bin/sh\ntouch {marker}\n")
+        executable.chmod(0o755)
+        drifted = self.broker.submit(
+            spec((str(executable),), label="drifted-executable")
+        )
+        executable.write_text(f"#!/bin/sh\ntouch {marker}\n# changed\n")
+        self.assertTrue(await self.broker.cancel(holder.job_id, reason="release"))
+        result = await terminal_event(drifted)
+        self.assertEqual(result["state"], "failed")
+        self.assertEqual(result["exit_code"], 1)
+        self.assertIn("admission drift", result["reason"])
+        self.assertFalse(marker.exists())
 
     async def test_status_exposes_identity(self):
         snapshot = self.broker.snapshot()

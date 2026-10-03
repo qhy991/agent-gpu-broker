@@ -10,6 +10,18 @@ The broker is deliberately single-host. Each job requests `shared` correctness
 capacity or `exclusive` clean-card capacity and one or more GPUs. Cooperating
 local schedulers can use its per-card lock directory to avoid co-tenancy.
 
+The exact v0.6.0 A800/B200 admission-receipt qualification is recorded in
+[the qualification report](docs/v0.6.0-admission-receipt-qualification-2026-08-25.md).
+
+Version 0.7 adds optional `gpuq run --allowed-gpus 0,1` job constraints. These
+are physical indices from the site's permitted pool; the daemon rejects invalid
+or impossible scopes and never allocates outside them, including shared packing.
+The exact requested scope is bound into the launch identity and admission receipt.
+Requests omitting the option keep the managed-pool default. The candidate's CPU
+tests do not extend the historical v0.6 device qualification to v0.7.
+Scoped requests use `op=run-scoped` on the same FIFO submission path, so a v0.6
+server rejects them before admission instead of ignoring a new JSON field.
+
 ## Architecture
 
 ```text
@@ -26,6 +38,9 @@ read-only projection containing:
 - `status.json`: current GPU states, running jobs, queue order, and ETA;
 - `events.jsonl`: accepted, started, and terminal lifecycle events;
 - `jobs/<job-id>/`: request metadata, stdout/stderr logs, and result JSON.
+
+Each admitted job also has `jobs/<job-id>/admission.json`, a mode-0600
+broker-issued projection of the exact launch identity.
 
 ## Install
 
@@ -114,6 +129,63 @@ start depends on that service report `eta=unknown` instead of a fabricated
 multi-month duration. A bounded job that runs past its declared estimate also
 makes dependent ETAs unknown; an overdue process is not treated as finishing
 immediately.
+
+## GPU probe health
+
+Each `nvidia-smi` call has a 10-second timeout; timeout/cancellation kills and
+reaps that probe process. Probe failure does not release active job allocations.
+The scheduler keeps expiring queued requests and retries the next normal poll.
+A single scheduler exception is reported without terminating the loop.
+
+`gpuq status` exposes the last successful `gpu_observed_at` and its monotonic
+`gpu_observation_age_seconds`. `updated_at` is only response time. After the
+probe bound plus two poll intervals without a successful observation,
+`probe_error` reports stale data and queue ETA is unknown. Agents must treat an
+unavailable or stale probe as unknown, even if old GPU rows still say idle.
+
+Queue status includes `allowed_gpu_ids`: `null` means the managed pool. A scoped
+head can block later unscoped work despite idle GPUs. ETA follows that same FIFO
+order; this successor does not introduce backfill or alter allocation policy.
+
+## Broker-issued admission receipts
+
+A long-running evaluator can ask `gpu-run` to atomically save the receipt that
+the broker emits after process start:
+
+```bash
+gpu-run \
+  --label fibserve-campaign \
+  --mode exclusive \
+  --gpu-count 1 \
+  --estimate unknown \
+  --run-timeout 2h \
+  --receipt-out /path/to/fibserve-admission.json \
+  --env SERVICE_PORT=10000 \
+  -- /path/to/start-fibserve.sh
+```
+
+While the job is active, an independent controller can re-query the same
+receipt through the broker socket:
+
+```bash
+gpuq receipt gpuq-<job-id> --out /path/to/live-admission.json
+```
+
+Schema `gpuq.admission-receipt.v1` binds:
+
+- canonical launch-spec, argv, and explicit environment-override SHA-256;
+- cwd, owner, label, mode, GPU count, and timeouts;
+- resolved executable path plus file SHA-256;
+- broker version/instance and submit/start timestamps;
+- allocated physical GPU IDs;
+- SHA-256 of the complete effective child environment, including the
+  broker-owned `CUDA_VISIBLE_DEVICES`.
+
+The receipt exposes environment keys and digests, never environment values.
+The executable is fingerprinted at admission, rechecked immediately before
+spawn, and executed through the resolved path. Content/path drift fails before
+the command starts. Active receipt lookup closes when a job becomes terminal;
+the private job directory and terminal result retain the durable digests.
 
 Before a request enters the FIFO, the daemon checks that its own unprivileged
 identity can enter the working directory and execute the command. Rejected

@@ -32,6 +32,9 @@ gpu-run --label correctness-v7 --mode shared --gpu-count 1 \
 
 - Keep the daemon as the sole owner of queue state and scheduling policy.
 - Shared files are projections, logs, and results; clients must not edit them.
+- Broker-issued admission receipts own launch-spec, explicit environment,
+  executable, allocation, and effective-environment digests. Never expose
+  environment values in a receipt or let a client assert these facts itself.
 - Preserve one FIFO path. Express shared/exclusive and GPU count as resource
   request data, not separate command paths.
 - Use only the Python standard library unless a dependency removes more

@@ -6,15 +6,17 @@ import argparse
 import asyncio
 import getpass
 import json
+import math
 import os
 import signal
 import socket
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
 from .broker import GpuBroker
-from .server import BrokerServer
+from .server import BrokerServer, SCOPED_RUN_OPERATION
 
 DEFAULT_SOCKET = Path("/tmp/agent-gpu-broker.sock")
 DEFAULT_STATE_DIR = Path.home() / ".local/share/agent-gpu-broker"
@@ -32,7 +34,7 @@ def parse_duration(value: str) -> float:
         result = float(text) * multiplier
     except ValueError as exc:
         raise argparse.ArgumentTypeError(f"invalid duration: {value}") from exc
-    if result <= 0:
+    if not math.isfinite(result) or result <= 0:
         raise argparse.ArgumentTypeError("duration must be positive")
     return result
 
@@ -50,6 +52,16 @@ def positive_int(value: str) -> int:
         raise argparse.ArgumentTypeError(f"invalid integer: {value}") from exc
     if result < 1:
         raise argparse.ArgumentTypeError("value must be positive")
+    return result
+
+
+def parse_gpu_ids(value: str) -> list[int]:
+    parts = value.split(",")
+    if not parts or any(not part.strip().isdigit() for part in parts):
+        raise argparse.ArgumentTypeError("allowed GPUs must be comma-separated physical indices")
+    result = [int(part.strip()) for part in parts]
+    if len(set(result)) != len(result):
+        raise argparse.ArgumentTypeError("allowed GPUs must be distinct")
     return result
 
 
@@ -74,6 +86,13 @@ def _parser() -> argparse.ArgumentParser:
     cancel.add_argument("job_id")
     cancel.add_argument("--socket", type=Path, default=DEFAULT_SOCKET)
 
+    receipt = subparsers.add_parser(
+        "receipt", help="show one active job's broker-issued admission receipt"
+    )
+    receipt.add_argument("job_id")
+    receipt.add_argument("--socket", type=Path, default=DEFAULT_SOCKET)
+    receipt.add_argument("--out", type=Path)
+
     run = subparsers.add_parser("run", help="queue and run one GPU command")
     run.add_argument("--socket", type=Path, default=DEFAULT_SOCKET)
     run.add_argument("--label", required=True, help="human-readable job name")
@@ -91,6 +110,13 @@ def _parser() -> argparse.ArgumentParser:
         default=900.0,
     )
     run.add_argument("--env", action="append", default=[], metavar="KEY=VALUE")
+    run.add_argument("--allowed-gpus", type=parse_gpu_ids,
+                     help="restrict allocation to these managed physical GPU indices")
+    run.add_argument(
+        "--receipt-out",
+        type=Path,
+        help="atomically write the started job's broker-issued admission receipt",
+    )
     run.add_argument("argv", nargs=argparse.REMAINDER)
     return parser
 
@@ -103,6 +129,8 @@ def main(argv: list[str] | None = None) -> int:
         return _status(args)
     if args.command == "cancel":
         return _cancel(args)
+    if args.command == "receipt":
+        return _receipt(args)
     if args.command == "run":
         return _run(args)
     raise AssertionError(args.command)
@@ -174,6 +202,10 @@ def _status(args: argparse.Namespace) -> int:
     )
     if snapshot.get("probe_error"):
         print(f"probe error: {snapshot['probe_error']}")
+    print(
+        f"GPU observation at={snapshot.get('gpu_observed_at') or 'unknown'} "
+        f"age_seconds={snapshot.get('gpu_observation_age_seconds')}"
+    )
     print("GPUS")
     for gpu in snapshot["gpus"]:
         jobs = gpu.get("jobs", [])
@@ -201,7 +233,7 @@ def _status(args: argparse.Namespace) -> int:
         print(
             f"  {job['position']}. {job['job_id']} owner={job['owner']} "
             f"label={job['label']} mode={job['mode']} gpus={job['gpu_count']} "
-            f"eta={eta}"
+            f"allowed={job.get('allowed_gpu_ids', 'unknown')} eta={eta}"
         )
     return 0
 
@@ -225,6 +257,27 @@ def _request_cancel(socket_path: Path, job_id: str) -> bool:
     with client, connection:
         response = json.loads(connection.readline())
     return bool(response.get("ok"))
+
+
+def _receipt(args: argparse.Namespace) -> int:
+    try:
+        client, connection = _request(
+            args.socket, {"op": "receipt", "job_id": args.job_id}
+        )
+        with client, connection:
+            response = json.loads(connection.readline())
+    except (OSError, RuntimeError, json.JSONDecodeError) as exc:
+        print(f"gpuq: {exc}", file=sys.stderr)
+        return 1
+    receipt = response.get("receipt")
+    if not response.get("ok") or not isinstance(receipt, dict):
+        print(f"gpuq: active job receipt not found: {args.job_id}", file=sys.stderr)
+        return 1
+    if args.out is not None:
+        _atomic_json(args.out.expanduser().resolve(), receipt)
+    else:
+        print(json.dumps(receipt, indent=2, ensure_ascii=False))
+    return 0
 
 
 def _parse_env(values: list[str]) -> dict[str, str]:
@@ -251,13 +304,14 @@ def _run(args: argparse.Namespace) -> int:
         client, connection = _request(
             args.socket,
             {
-                "op": "run",
+                "op": SCOPED_RUN_OPERATION if getattr(args, "allowed_gpus", None) is not None else "run",
                 "argv": command,
                 "cwd": str(args.cwd.expanduser().resolve()),
                 "owner": args.owner,
                 "label": args.label,
                 "mode": args.mode,
                 "gpu_count": args.gpu_count,
+                "allowed_gpu_ids": getattr(args, "allowed_gpus", None),
                 "estimate_s": args.estimate,
                 "queue_timeout_s": args.queue_timeout,
                 "run_timeout_s": args.run_timeout,
@@ -276,9 +330,12 @@ def _run(args: argparse.Namespace) -> int:
             kind = event.get("type")
             if kind == "accepted":
                 job_id = str(event["job_id"])
+                admission = event.get("admission_receipt") or {}
+                digest = admission.get("launch_spec_sha256")
+                suffix = f" admission={str(digest)[:12]}" if digest else ""
                 _note(
                     f"accepted job {event['job_id']} label={event['label']} "
-                    f"mode={event['mode']} gpus={event['gpu_count']}"
+                    f"mode={event['mode']} gpus={event['gpu_count']}{suffix}"
                 )
             elif kind == "queued":
                 message = (
@@ -289,6 +346,13 @@ def _run(args: argparse.Namespace) -> int:
                     message += f" probe_error={event['probe_error']}"
                 _note(message)
             elif kind == "started":
+                if args.receipt_out is not None:
+                    receipt = event.get("admission_receipt")
+                    if not isinstance(receipt, dict):
+                        raise RuntimeError(
+                            "broker did not provide the requested admission receipt"
+                        )
+                    _atomic_json(args.receipt_out.expanduser().resolve(), receipt)
                 _note(
                     "running on physical GPUs "
                     f"{','.join(map(str, event['gpu_ids']))} "
@@ -313,13 +377,28 @@ def _run(args: argparse.Namespace) -> int:
                 break
     except KeyboardInterrupt:
         return _interrupt_and_cancel(args.socket, job_id)
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, RuntimeError, json.JSONDecodeError) as exc:
         print(f"gpu-run: connection failed: {exc}", file=sys.stderr)
         return 1
     finally:
         connection.close()
         client.close()
     return exit_code
+
+
+def _atomic_json(path: Path, value: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(value, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+        os.replace(temporary, path)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
 
 
 def _interrupt_and_cancel(socket_path: Path, job_id: str | None) -> int:
