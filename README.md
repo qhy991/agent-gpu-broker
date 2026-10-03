@@ -130,6 +130,23 @@ multi-month duration. A bounded job that runs past its declared estimate also
 makes dependent ETAs unknown; an overdue process is not treated as finishing
 immediately.
 
+## GPU probe health
+
+Each `nvidia-smi` call has a 10-second timeout; timeout/cancellation kills and
+reaps that probe process. Probe failure does not release active job allocations.
+The scheduler keeps expiring queued requests and retries the next normal poll.
+A single scheduler exception is reported without terminating the loop.
+
+`gpuq status` exposes the last successful `gpu_observed_at` and its monotonic
+`gpu_observation_age_seconds`. `updated_at` is only response time. After the
+probe bound plus two poll intervals without a successful observation,
+`probe_error` reports stale data and queue ETA is unknown. Agents must treat an
+unavailable or stale probe as unknown, even if old GPU rows still say idle.
+
+Queue status includes `allowed_gpu_ids`: `null` means the managed pool. A scoped
+head can block later unscoped work despite idle GPUs. ETA follows that same FIFO
+order; this successor does not introduce backfill or alter allocation policy.
+
 ## Broker-issued admission receipts
 
 A long-running evaluator can ask `gpu-run` to atomically save the receipt that

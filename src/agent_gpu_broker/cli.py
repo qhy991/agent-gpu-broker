@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import getpass
 import json
+import math
 import os
 import signal
 import socket
@@ -33,7 +34,7 @@ def parse_duration(value: str) -> float:
         result = float(text) * multiplier
     except ValueError as exc:
         raise argparse.ArgumentTypeError(f"invalid duration: {value}") from exc
-    if result <= 0:
+    if not math.isfinite(result) or result <= 0:
         raise argparse.ArgumentTypeError("duration must be positive")
     return result
 
@@ -201,6 +202,10 @@ def _status(args: argparse.Namespace) -> int:
     )
     if snapshot.get("probe_error"):
         print(f"probe error: {snapshot['probe_error']}")
+    print(
+        f"GPU observation at={snapshot.get('gpu_observed_at') or 'unknown'} "
+        f"age_seconds={snapshot.get('gpu_observation_age_seconds')}"
+    )
     print("GPUS")
     for gpu in snapshot["gpus"]:
         jobs = gpu.get("jobs", [])
@@ -228,7 +233,7 @@ def _status(args: argparse.Namespace) -> int:
         print(
             f"  {job['position']}. {job['job_id']} owner={job['owner']} "
             f"label={job['label']} mode={job['mode']} gpus={job['gpu_count']} "
-            f"eta={eta}"
+            f"allowed={job.get('allowed_gpu_ids', 'unknown')} eta={eta}"
         )
     return 0
 

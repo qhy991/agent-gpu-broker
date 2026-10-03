@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__
-from .gpu import CardLock, GpuInventory, NvidiaSmiInventory, try_card_lock
+from .gpu import GPU_PROBE_TIMEOUT_S, CardLock, GpuInventory, NvidiaSmiInventory, try_card_lock
 
 MODES = frozenset({"shared", "exclusive"})
 LAUNCH_SPEC_SCHEMA = "gpuq.launch-spec.v1"
@@ -337,6 +337,8 @@ class GpuBroker:
         self._recent: deque[dict[str, Any]] = deque(maxlen=20)
         self._gpu_observation: dict[int, dict[str, Any]] = {}
         self._probe_error: str | None = None
+        self._gpu_observed_at: str | None = None
+        self._gpu_observed_mono: float | None = None
         self._instance_id = _instance_id()
         self._wakeup = asyncio.Event()
         self._scheduler: asyncio.Task[None] | None = None
@@ -490,7 +492,12 @@ class GpuBroker:
             "broker_version": BROKER_VERSION,
             "instance_id": self._instance_id,
             "updated_at": _utc_now(),
-            "probe_error": self._probe_error,
+            "probe_error": self._observation_error(now),
+            "gpu_observed_at": self._gpu_observed_at,
+            "gpu_observation_age_seconds": (
+                max(0.0, now - self._gpu_observed_mono)
+                if self._gpu_observed_mono is not None else None
+            ),
             "shared_capacity": self._shared_capacity,
             "gpus": [
                 {
@@ -516,12 +523,22 @@ class GpuBroker:
         return admission_receipt_value(job) if job is not None else None
 
     async def _scheduler_loop(self) -> None:
-        while True:
-            self._wakeup.clear()
-            self._expire_queued_jobs()
-            await self._schedule_jobs()
-            self._publish_queue(force=False)
-            self._write_status()
+        while not self._closed:
+            try:
+                self._wakeup.clear()
+                self._expire_queued_jobs()
+                await self._schedule_jobs()
+                self._publish_queue(force=False)
+                self._write_status()
+            except Exception as exc:
+                # Preserve the loop after one bad probe, observation or write.
+                # Cancellation remains a shutdown request, not a retry.
+                import traceback
+
+                traceback.print_exc()
+                self._mark_gpu_unavailable(
+                    f"scheduler iteration failed: {type(exc).__name__}: {exc}"
+                )
             wake = asyncio.create_task(
                 self._wakeup.wait(), name="gpuq-scheduler-wakeup"
             )
@@ -530,14 +547,30 @@ class GpuBroker:
             )
             waiters = {wake, poll}
             try:
-                _done, pending = await asyncio.wait(
-                    waiters, return_when=asyncio.FIRST_COMPLETED
-                )
+                await asyncio.wait(waiters, return_when=asyncio.FIRST_COMPLETED)
             finally:
                 for waiter in waiters:
                     if not waiter.done():
                         waiter.cancel()
                 await asyncio.gather(*waiters, return_exceptions=True)
+
+    def _mark_gpu_unavailable(self, reason: str) -> None:
+        self._probe_error = reason
+        self._gpu_observation = {
+            gpu_id: {"state": "unavailable", "reason": reason}
+            for gpu_id in self._gpu_ids
+        }
+
+    def _observation_error(self, now: float) -> str | None:
+        if self._probe_error:
+            return self._probe_error
+        if self._gpu_observed_mono is None:
+            return "GPU occupancy has not been observed"
+        # One bounded probe plus two ordinary polling intervals. Reading status
+        # cannot refresh this clock or hide a stopped scheduler.
+        if now - self._gpu_observed_mono > GPU_PROBE_TIMEOUT_S + 2 * self._poll_interval_s:
+            return "GPU occupancy observation is stale"
+        return None
 
     def _expire_queued_jobs(self) -> None:
         now = time.monotonic()
@@ -559,11 +592,7 @@ class GpuBroker:
         try:
             occupancy = await self._inventory.compute_pids()
         except Exception as exc:  # fail closed when cleanliness is unknown
-            self._probe_error = str(exc)
-            self._gpu_observation = {
-                gpu_id: {"state": "unavailable", "reason": self._probe_error}
-                for gpu_id in self._gpu_ids
-            }
+            self._mark_gpu_unavailable(str(exc))
             return
 
         self._probe_error = None
@@ -575,6 +604,8 @@ class GpuBroker:
             self._queue.popleft()
             self._start_job(job, gpu_ids)
         self._gpu_observation = self._observe_gpus(occupancy)
+        self._gpu_observed_at = _utc_now()
+        self._gpu_observed_mono = time.monotonic()
 
     def _eligible_gpu_ids(self, spec: JobSpec) -> tuple[int, ...]:
         return tuple(gpu for gpu in self._gpu_ids
@@ -904,6 +935,8 @@ class GpuBroker:
         self._write_status()
 
     def _queue_eta(self, now: float) -> dict[str, float | None]:
+        if self._observation_error(now):
+            return {job.job_id: None for job in self._queue}
         available_ids = [
             gpu_id
             for gpu_id in self._gpu_ids
@@ -938,9 +971,10 @@ class GpuBroker:
 
         result: dict[str, float | None] = {}
         queue = list(self._queue)
+        fifo_start: float | None = 0.0
         for index, job in enumerate(queue):
             eligible = self._eligible_gpu_ids(job.spec)
-            if job.spec.gpu_count > len(virtual):
+            if job.spec.gpu_count > sum(gpu_id in eligible for gpu_id in virtual):
                 for blocked in queue[index:]:
                     result[blocked.job_id] = None
                 break
@@ -954,7 +988,7 @@ class GpuBroker:
                     key=self._eta_sort_key,
                 )
                 selected = ready[: job.spec.gpu_count]
-                start = self._latest_eta(*(item[0] for item in selected))
+                start = self._latest_eta(fifo_start, *(item[0] for item in selected))
                 for _, gpu_id in selected:
                     virtual[gpu_id]["exclusive_until"] = self._eta_end(
                         start, job.spec.estimate_s
@@ -970,7 +1004,7 @@ class GpuBroker:
                     key=self._eta_sort_key,
                 )
                 selected = ready[: job.spec.gpu_count]
-                start = self._latest_eta(*(item[0] for item in selected))
+                start = self._latest_eta(fifo_start, *(item[0] for item in selected))
                 for _, gpu_id in selected:
                     state = virtual[gpu_id]
                     if start is not None:
@@ -983,6 +1017,7 @@ class GpuBroker:
                         self._eta_end(start, job.spec.estimate_s)
                     )
             result[job.job_id] = start
+            fifo_start = start
         return result
 
     @staticmethod
@@ -1059,6 +1094,9 @@ class GpuBroker:
             "mode": job.spec.mode,
             "gpu_count": job.spec.gpu_count,
             "gpu_ids": list(job.gpu_ids),
+            "allowed_gpu_ids": (
+                list(job.spec.allowed_gpu_ids) if job.spec.allowed_gpu_ids is not None else None
+            ),
             "submitted_at": job.submitted_at,
             "started_at": job.started_at,
             "wait_seconds": max(0.0, wait_end - job.submitted_mono),

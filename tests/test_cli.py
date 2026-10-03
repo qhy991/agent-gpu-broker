@@ -58,8 +58,9 @@ class DurationTests(unittest.TestCase):
         self.assertEqual(parse_duration("1.5h"), 5400)
 
     def test_rejects_non_positive(self):
-        with self.assertRaises(argparse.ArgumentTypeError):
-            parse_duration("0")
+        for value in ("0", "-1", "nan", "inf"):
+            with self.subTest(value=value), self.assertRaises(argparse.ArgumentTypeError):
+                parse_duration(value)
 
     def test_positive_integer(self):
         self.assertEqual(positive_int("2"), 2)

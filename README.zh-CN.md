@@ -163,6 +163,21 @@ ETA 是根据任务声明的 `--estimate`、GPU 数量、共享槽位和正在�
 时间。有限任务超过其声明 estimate 后，依赖它的 ETA 也会转为 `unknown`；逾期进程
 不会被假定为立即结束。
 
+## GPU 探测健康状态
+
+每次 `nvidia-smi` 有 10 秒限时；超时或取消会终止并回收该探测子进程。探测失败
+不释放已有作业的 GPU 租约；调度器仍处理队列超时，并在下一轮正常轮询重试。
+单次调度异常会被报告，不会让整个循环静默退出。
+
+`gpuq status` 输出最后成功探测时间 `gpu_observed_at`，以及基于 monotonic
+时钟的 `gpu_observation_age_seconds`。`updated_at` 仅代表状态响应时间。
+超过探测限时加两个轮询周期仍无成功观察时，`probe_error` 报告陈旧，ETA 为
+unknown。即使旧 GPU 行仍写 idle，也不能把未知或陈旧观察解释为空闲。
+
+队列同时展示 `allowed_gpu_ids`，其中 `null` 表示受管理设备池。限定卡队首
+可能在其他卡空闲时挡住后面的不限卡工作；ETA 也遵循这条 FIFO 顺序。本轮不增加
+backfill，也不改变分配策略。
+
 ## Broker admission receipt
 
 长驻 evaluator 可以让 `gpu-run` 在进程启动后原子保存 broker 签发的 receipt：

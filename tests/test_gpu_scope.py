@@ -9,6 +9,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from agent_gpu_broker import __version__
 from agent_gpu_broker.broker import GpuBroker, admission_receipt_value, launch_spec_value
 from agent_gpu_broker.cli import parse_gpu_ids
 from agent_gpu_broker.server import BrokerServer
@@ -16,6 +17,32 @@ from test_broker import FakeInventory, spec, terminal_events
 
 
 class GpuScopeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_fifo_eta_does_not_skip_scoped_head(self):
+        first = self.broker.submit(dataclasses.replace(
+            spec("import time; time.sleep(.3)", label="holder", estimate_s=0.3),
+            allowed_gpu_ids=(1,),
+        ))
+        while (await asyncio.wait_for(first.events.get(), timeout=3))["type"] != "started":
+            pass
+        head = self.broker.submit(self.request((1,)))
+        later = self.broker.submit(self.request((7,)))
+        rows = {row["job_id"]: row for row in self.broker.snapshot()["queue"]}
+        self.assertEqual(rows[head.job_id]["allowed_gpu_ids"], [1])
+        self.assertGreater(rows[head.job_id]["eta_seconds"], 0)
+        self.assertGreaterEqual(rows[later.job_id]["eta_seconds"], rows[head.job_id]["eta_seconds"])
+        await asyncio.gather(*(terminal_events(job) for job in (first, head, later)))
+
+    async def test_foreign_scoped_head_makes_following_eta_unknown(self):
+        self.inventory.occupancy = {1: [999999]}
+        await asyncio.sleep(0.03)
+        head = self.broker.submit(self.request((1,), queue_timeout_s=0.05))
+        later = self.broker.submit(self.request((7,)))
+        rows = self.broker.snapshot()["queue"]
+        self.assertEqual(len(rows), 2)
+        self.assertTrue(all(row["eta_seconds"] is None for row in rows))
+        self.assertEqual((await terminal_events(head))[-1]["state"], "queue_timeout")
+        self.assertEqual((await terminal_events(later))[-1]["state"], "completed")
+
     async def asyncSetUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
@@ -46,7 +73,7 @@ class GpuScopeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(job.gpu_ids, (1,))
         receipt = admission_receipt_value(job)
         self.assertEqual(receipt["allowed_gpu_ids"], [7, 1])
-        self.assertEqual(receipt["broker_version"], "0.7.0")
+        self.assertEqual(receipt["broker_version"], __version__)
         self.assertIn("1", "".join(e.get("data", "") for e in events))
         self.assertNotEqual(launch_spec_value(self.request((1,))), launch_spec_value(self.request((7,))))
 
