@@ -14,6 +14,11 @@
 
 ### Fixed
 
+- Keep this compatible repair on the `0.7.1.dev0` maintenance line: the live
+  B300-M3 NCU consumers accept only `0.7.*` admission receipts. The scoped wire
+  contract is unchanged; the undeployed 0.8 development candidate is superseded
+  without editing frozen experiment sources (`src/agent_gpu_broker/__init__.py`).
+
 - Integrate main's scheduler/connection hardening with the exact `807aea5` GPU
   scope and admission source. One iteration error no longer kills the queue;
   wakeup/close races preserve cancellation and leave no polling tasks.
@@ -24,6 +29,6 @@
   unknown ETA, and later jobs cannot claim to start before their predecessor.
   Reject nonfinite CLI durations (`broker.py`, `cli.py`).
 
-This is an unreleased `0.8.0.dev0` successor. The deployed B300-M3 source was
+This is an unreleased `0.7.1.dev0` successor. The deployed B300-M3 source was
 independently matched to `807aea5`; these repairs have not been deployed.
 CPU/fake-inventory tests do not establish device correctness or performance.
