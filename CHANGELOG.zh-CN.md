@@ -4,6 +4,8 @@
 
 ### Added
 
+- 为每个已启动的 GPU 作业提供独立临时 CUDA 驱动缓存。进程结束后回收缓存，先释放 GPU 分配，再执行主机清理；清理时间不计入执行时长，日志和回执保持保留。broker 替换显式缓存路径，避免 agent 启动器在每个实验 HOME 中长期积累缓存（`broker.py`）。
+
 - 新增可选 `--allowed-gpus` / `allowed_gpu_ids` 作业范围。broker 校验受管理的物理 GPU 编号，在独占分配、共享打包和 ETA 中使用相同范围，并将其绑定到启动身份与 admission 回执；没有范围的旧请求继续使用受管理设备池默认值。此实现提供 KerSor NCU 要求的 broker 0.7 合同（`broker.py`、`server.py`、`cli.py`、GPU 范围测试）。
 
 - 输出最后成功探测时间 `gpu_observed_at` 与基于 monotonic 时钟的
