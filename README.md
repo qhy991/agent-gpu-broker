@@ -220,3 +220,17 @@ required:
 ```bash
 python -m unittest discover -s tests -v
 ```
+
+## CUDA cache lifecycle
+
+The broker supplies a unique `CUDA_CACHE_PATH` for each started job, including
+agent-authored launchers. It replaces inherited/client cache paths; the effective
+environment digest binds the actual choice without publishing environment values.
+The CUDA context and warmup run inside that one job. After completion, failure,
+execution timeout or cancellation, the broker reaps the process, releases the GPU
+and removes only its temporary driver cache. GPU duration excludes host cleanup.
+Candidate files, logs, profiler reports and receipts are not cache cleanup targets.
+A queued job allocates no cache. A cleanup failure is explicit in the terminal
+receipt and cannot retain the GPU allocation or change the command verdict.
+Container launchers must use container-temporary cache storage or forward a
+mounted broker cache; a cache path in persistent task HOME is not allowed.

@@ -4,6 +4,7 @@ import asyncio
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 from agent_gpu_broker.broker import GpuBroker, JobSpec
@@ -70,6 +71,46 @@ class BrokerTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         await self.broker.close()
         self.temp.cleanup()
+
+    async def test_driver_cache_is_private_and_removed_for_each_ended_job(self):
+        paths = []
+        for index, outcome in enumerate([0, 7, 0, 0]):
+            code = ("import os,pathlib,sys; p=pathlib.Path(os.environ['CUDA_CACHE_PATH']); "
+                    "p.mkdir(exist_ok=True); (p/'jit.bin').write_bytes(b'x'*1048576); "
+                    "print(str(p),flush=True); " +
+                    ("import time; time.sleep(5)" if index >= 2 else f"sys.exit({outcome})"))
+            request = spec(code, label=f"cache-{index}", run_timeout_s=.15 if index == 2 else 2)
+            request.env['CUDA_CACHE_PATH'] = str(Path(self.temp.name)/'persistent-do-not-use')
+            job = self.broker.submit(request)
+            if index == 3:
+                while job.process is None: await asyncio.sleep(.005)
+                await asyncio.sleep(.03)
+                await self.broker.cancel(job.job_id, reason='cache cancellation fixture')
+            events = await terminal_events(job)
+            output = ''.join(e['data'] for e in events if e['type']=='output' and e['stream']=='stdout').strip()
+            cache = Path(output)
+            self.assertTrue(cache.is_absolute())
+            self.assertFalse(cache.exists())
+            self.assertEqual(events[-1]['cuda_cache_cleanup'], {'removed': True})
+            self.assertEqual(events[-1]['state'], ['completed','failed','run_timeout','cancelled'][index])
+            paths.append(output)
+        self.assertEqual(len(set(paths)),4)
+        self.assertFalse((Path(self.temp.name)/'persistent-do-not-use').exists())
+        self.assertEqual(self.broker.snapshot()['running'],[])
+
+    async def test_cache_cleanup_failure_preserves_verdict_and_releases_allocation(self):
+        with patch('agent_gpu_broker.broker.tempfile.TemporaryDirectory.cleanup',
+                   side_effect=PermissionError('cache fixture')):
+            job = self.broker.submit(spec('import sys; sys.exit(7)', label='cleanup-failure'))
+            ended = (await terminal_events(job))[-1]
+        self.assertEqual(ended['state'], 'failed')
+        self.assertEqual(ended['exit_code'], 7)
+        self.assertEqual(ended['cuda_cache_cleanup']['removed'], False)
+        self.assertEqual(ended['cuda_cache_cleanup']['error_type'], 'PermissionError')
+        self.assertTrue(Path(ended['cuda_cache_cleanup']['path']).is_absolute())
+        self.assertEqual(self.broker.snapshot()['running'], [])
+        successor = self.broker.submit(spec('print("next")', label='after-cleanup-failure'))
+        self.assertEqual((await terminal_events(successor))[-1]['state'], 'completed')
 
     async def test_fifo_queue_streams_position_then_runs(self):
         first = self.broker.submit(

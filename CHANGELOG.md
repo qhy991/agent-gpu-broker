@@ -4,6 +4,8 @@
 
 ### Added
 
+- Give every admitted GPU process its own temporary CUDA driver cache. Reap the process before deleting the cache, release the allocation before host cleanup, exclude cleanup time from device duration, and preserve logs/receipts. This covers arbitrary agent launchers without growing experiment HOME directories. Explicit cache paths are replaced by the broker-owned per-job path (`broker.py`).
+
 - Add optional `--allowed-gpus` / `allowed_gpu_ids` job scope. The broker validates managed physical indices, applies the same scope to exclusive allocation, shared packing and ETA, and binds it into the launch identity and admission receipt. Legacy requests without a scope retain the managed-pool default. This supplies the broker 0.7 contract required by KerSor NCU (`broker.py`, `server.py`, `cli.py`, GPU scope tests).
 
 - Expose last successful `gpu_observed_at` and monotonic

@@ -710,6 +710,7 @@ class GpuBroker:
         state = "failed"
         exit_code = 1
         reason: str | None = None
+        cuda_cache: tempfile.TemporaryDirectory | None = None
         try:
             assert job.admission is not None
             executable = _resolve_executable(job.spec)
@@ -723,9 +724,14 @@ class GpuBroker:
                 raise RuntimeError(
                     "admission drift: executable path or content changed before start"
                 )
+            # Disk JIT cache has exactly the lifetime of this device process.
+            # HOME may be task-owned, but it must not accumulate one driver cache
+            # per candidate; never share a warm cache across measurements.
+            cuda_cache = tempfile.TemporaryDirectory(prefix=f"gpuq-{job.job_id}-cuda-")
             environment = {
                 **os.environ,
                 **job.spec.env,
+                "CUDA_CACHE_PATH": cuda_cache.name,
                 "CUDA_VISIBLE_DEVICES": ",".join(map(str, job.gpu_ids)),
             }
             job.effective_env_sha256 = digest_json(environment)
@@ -793,8 +799,20 @@ class GpuBroker:
                 await self._terminate(job.process)
             await asyncio.gather(*output_tasks, return_exceptions=True)
         finally:
+            runtime_ended_mono = time.monotonic()
             self._release_allocation(job)
-            self._finish(job, state=state, exit_code=exit_code, reason=reason)
+            cache_cleanup = None
+            if cuda_cache is not None:
+                try:
+                    cuda_cache.cleanup()
+                    cache_cleanup = {"removed": True}
+                except OSError as error:
+                    # Storage failure cannot retain a GPU allocation or replace
+                    # the workload verdict. Keep it explicit for maintenance.
+                    cache_cleanup = {"removed": False, "error_type": type(error).__name__,
+                                     "path": cuda_cache.name}
+            self._finish(job, state=state, exit_code=exit_code, reason=reason,
+                         runtime_ended_mono=runtime_ended_mono, cache_cleanup=cache_cleanup)
             self._wakeup.set()
 
     def _release_allocation(self, job: Job) -> None:
@@ -884,14 +902,15 @@ class GpuBroker:
         )
 
     def _finish(
-        self, job: Job, *, state: str, exit_code: int, reason: str | None
+        self, job: Job, *, state: str, exit_code: int, reason: str | None,
+        runtime_ended_mono: float | None = None, cache_cleanup: dict[str, Any] | None = None
     ) -> None:
         if job.job_id not in self._jobs:
             return
         completed_at = _utc_now()
         completed_mono = time.monotonic()
         duration_s = (
-            max(0.0, completed_mono - job.started_mono)
+            max(0.0, (runtime_ended_mono if runtime_ended_mono is not None else completed_mono) - job.started_mono)
             if job.started_mono is not None
             else None
         )
@@ -917,6 +936,8 @@ class GpuBroker:
             "broker_version": BROKER_VERSION,
             "broker_instance_id": self._instance_id,
         }
+        if cache_cleanup is not None:
+            result["cuda_cache_cleanup"] = cache_cleanup
         admission = admission_receipt_value(job)
         if admission is not None:
             result["admission_launch_spec_sha256"] = admission[
