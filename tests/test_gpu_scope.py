@@ -68,7 +68,9 @@ class GpuScopeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.broker.snapshot()["running"], [])
         self.assertTrue(all(row["eta_seconds"] is None for row in self.broker.snapshot()["queue"]))
         for job in (head, broad, later):
-            self.assertEqual((await terminal_events(job))[-1]["state"], "queue_timeout")
+            self.assertTrue(await self.broker.cancel(job.job_id, reason="owned priority fixture"))
+        for job in (head, broad, later):
+            self.assertEqual((await terminal_events(job))[-1]["state"], "cancelled")
 
     async def test_unscoped_multi_gpu_request_retains_priority(self):
         self.inventory.occupancy = {0: [999999]}

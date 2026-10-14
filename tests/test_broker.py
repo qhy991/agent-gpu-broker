@@ -88,14 +88,19 @@ class BrokerTests(unittest.IsolatedAsyncioTestCase):
                     "p.mkdir(exist_ok=True); (p/'jit.bin').write_bytes(b'x'*1048576); "
                     "print(str(p),flush=True); " +
                     ("import time; time.sleep(5)" if index >= 2 else f"sys.exit({outcome})"))
-            request = spec(code, label=f"cache-{index}", run_timeout_s=.15 if index == 2 else 2)
+            request = spec(code, label=f"cache-{index}", run_timeout_s=2)
             request.env['CUDA_CACHE_PATH'] = str(Path(self.temp.name)/'persistent-do-not-use')
             job = self.broker.submit(request)
+            prefix = []
             if index == 3:
-                while job.process is None: await asyncio.sleep(.005)
-                await asyncio.sleep(.03)
+                while True:
+                    event = await asyncio.wait_for(job.events.get(), timeout=3)
+                    prefix.append(event)
+                    if event['type'] == 'output' and event['stream'] == 'stdout':
+                        break
+                    self.assertNotEqual(event['type'], 'finished', 'worker ended before cache observation')
                 await self.broker.cancel(job.job_id, reason='cache cancellation fixture')
-            events = await terminal_events(job)
+            events = prefix + await terminal_events(job)
             output = ''.join(e['data'] for e in events if e['type']=='output' and e['stream']=='stdout').strip()
             cache = Path(output)
             self.assertTrue(cache.is_absolute())
