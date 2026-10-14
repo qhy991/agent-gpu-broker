@@ -120,6 +120,11 @@ def _parser() -> argparse.ArgumentParser:
         type=Path,
         help="atomically write the started job's broker-issued admission receipt",
     )
+    run.add_argument(
+        "--result-out",
+        type=Path,
+        help="atomically write the exact received broker finished event",
+    )
     run.add_argument("argv", nargs=argparse.REMAINDER)
     return parser
 
@@ -303,6 +308,11 @@ def _run(args: argparse.Namespace) -> int:
         print("gpu-run: missing command after --", file=sys.stderr)
         return 2
     try:
+        result_out = getattr(args, "result_out", None)
+        if result_out is not None:
+            result_out = result_out.expanduser().resolve()
+            if args.receipt_out is not None and result_out == args.receipt_out.expanduser().resolve():
+                raise ValueError("--receipt-out and --result-out must use distinct paths")
         env = _parse_env(args.env)
         deadline = None
         if getattr(args, "host_monotonic_deadline", None) is not None:
@@ -372,6 +382,14 @@ def _run(args: argparse.Namespace) -> int:
                 stream.write(event["data"])
                 stream.flush()
             elif kind == "finished":
+                if result_out is not None:
+                    try:
+                        if job_id is None or event.get("job_id") != job_id:
+                            raise ValueError("finished event does not match the accepted job_id")
+                        _atomic_json(result_out, event)
+                    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                        print(f"gpu-run: result export failed: {exc}", file=sys.stderr)
+                        return 1
                 if event.get("warning"):
                     _note(f"warning: {event['warning']}")
                 reason = f" reason={event['reason']}" if event.get("reason") else ""
