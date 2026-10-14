@@ -603,13 +603,21 @@ class GpuBroker:
             return
 
         self._probe_error = None
-        while self._queue:
-            job = self._queue[0]
+        retained: deque[Job] = deque()
+        blocked_scopes: set[int] = set()
+        for job in self._queue:
+            eligible = set(self._eligible_gpu_ids(job.spec))
+            if eligible & blocked_scopes:
+                retained.append(job)
+                blocked_scopes.update(eligible)
+                continue
             gpu_ids = self._try_allocate(job, occupancy)
             if gpu_ids is None:
-                break
-            self._queue.popleft()
+                retained.append(job)
+                blocked_scopes.update(eligible)
+                continue
             self._start_job(job, gpu_ids)
+        self._queue = retained
         self._gpu_observation = self._observe_gpus(occupancy)
         self._gpu_observed_at = _utc_now()
         self._gpu_observed_mono = time.monotonic()
@@ -1004,13 +1012,15 @@ class GpuBroker:
 
         result: dict[str, float | None] = {}
         queue = list(self._queue)
-        fifo_start: float | None = 0.0
-        for index, job in enumerate(queue):
+        fifo_starts: dict[int, float | None] = dict.fromkeys(self._gpu_ids, 0.0)
+        for job in queue:
             eligible = self._eligible_gpu_ids(job.spec)
+            fifo_start = self._latest_eta(*(fifo_starts[gpu_id] for gpu_id in eligible))
             if job.spec.gpu_count > sum(gpu_id in eligible for gpu_id in virtual):
-                for blocked in queue[index:]:
-                    result[blocked.job_id] = None
-                break
+                result[job.job_id] = None
+                for gpu_id in eligible:
+                    fifo_starts[gpu_id] = None
+                continue
             if job.spec.mode == "exclusive":
                 ready = sorted(
                     (
@@ -1050,7 +1060,8 @@ class GpuBroker:
                         self._eta_end(start, job.spec.estimate_s)
                     )
             result[job.job_id] = start
-            fifo_start = start
+            for gpu_id in eligible:
+                fifo_starts[gpu_id] = start
         return result
 
     @staticmethod

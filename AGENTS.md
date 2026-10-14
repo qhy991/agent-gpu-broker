@@ -35,7 +35,9 @@ gpu-run --label correctness-v7 --mode shared --gpu-count 1 \
 - Broker-issued admission receipts own launch-spec, explicit environment,
   executable, allocation, and effective-environment digests. Never expose
   environment values in a receipt or let a client assert these facts itself.
-- Preserve one FIFO path. Express shared/exclusive and GPU count as resource
+- Preserve one queue and FIFO priority for requests with overlapping allowed GPU
+  sets. Disjoint sets may progress independently. An unscoped request covers all
+  managed GPUs. Express shared/exclusive, GPU count and allowed GPUs as resource
   request data, not separate command paths.
 - Use only the Python standard library unless a dependency removes more
   complexity than it adds.

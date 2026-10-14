@@ -17,7 +17,7 @@ from test_broker import FakeInventory, spec, terminal_events
 
 
 class GpuScopeTests(unittest.IsolatedAsyncioTestCase):
-    async def test_fifo_eta_does_not_skip_scoped_head(self):
+    async def test_disjoint_fifo_eta_is_independent_of_scoped_head(self):
         first = self.broker.submit(dataclasses.replace(
             spec("import time; time.sleep(.3)", label="holder", estimate_s=0.3),
             allowed_gpu_ids=(1,),
@@ -29,19 +29,83 @@ class GpuScopeTests(unittest.IsolatedAsyncioTestCase):
         rows = {row["job_id"]: row for row in self.broker.snapshot()["queue"]}
         self.assertEqual(rows[head.job_id]["allowed_gpu_ids"], [1])
         self.assertGreater(rows[head.job_id]["eta_seconds"], 0)
-        self.assertGreaterEqual(rows[later.job_id]["eta_seconds"], rows[head.job_id]["eta_seconds"])
+        self.assertEqual(rows[later.job_id]["eta_seconds"], 0.0)
         await asyncio.gather(*(terminal_events(job) for job in (first, head, later)))
 
-    async def test_foreign_scoped_head_makes_following_eta_unknown(self):
+    async def test_foreign_scoped_head_leaves_disjoint_eta_known(self):
         self.inventory.occupancy = {1: [999999]}
         await asyncio.sleep(0.03)
         head = self.broker.submit(self.request((1,), queue_timeout_s=0.05))
         later = self.broker.submit(self.request((7,)))
         rows = self.broker.snapshot()["queue"]
         self.assertEqual(len(rows), 2)
-        self.assertTrue(all(row["eta_seconds"] is None for row in rows))
+        self.assertIsNone(rows[0]["eta_seconds"])
+        self.assertEqual(rows[1]["eta_seconds"], 0.0)
         self.assertEqual((await terminal_events(head))[-1]["state"], "queue_timeout")
         self.assertEqual((await terminal_events(later))[-1]["state"], "completed")
+
+    async def test_foreign_head_does_not_hold_a_disjoint_worker(self):
+        self.inventory.occupancy = {0: [999999]}
+        await asyncio.sleep(0.03)
+        first = self.broker.submit(self.request((0,), queue_timeout_s=0.3))
+        second = self.broker.submit(self.request((1,)))
+        second_events = await terminal_events(second)
+        self.assertEqual(second_events[-1]["state"], "completed")
+        self.assertEqual(second.gpu_ids, (1,))
+        self.assertEqual(first.state, "queued")
+        self.assertEqual((await terminal_events(first))[-1]["state"], "queue_timeout")
+
+    async def test_overlap_propagates_through_an_older_broad_waiter(self):
+        self.inventory.occupancy = {0: [999999]}
+        await asyncio.sleep(0.03)
+        head = self.broker.submit(self.request((0,), queue_timeout_s=0.3))
+        broad = self.broker.submit(self.request((0, 1), queue_timeout_s=0.3))
+        later = self.broker.submit(self.request((1,), queue_timeout_s=0.3))
+        await asyncio.sleep(0.05)
+        self.assertEqual([j.state for j in (head, broad, later)], ["queued"] * 3)
+        self.assertEqual(self.broker.snapshot()["running"], [])
+        self.assertTrue(all(row["eta_seconds"] is None for row in self.broker.snapshot()["queue"]))
+        for job in (head, broad, later):
+            self.assertEqual((await terminal_events(job))[-1]["state"], "queue_timeout")
+
+    async def test_unscoped_multi_gpu_request_retains_priority(self):
+        self.inventory.occupancy = {0: [999999]}
+        await asyncio.sleep(0.03)
+        head = self.broker.submit(self.request(None, gpu_count=3, queue_timeout_s=0.2))
+        later = self.broker.submit(self.request((1,), queue_timeout_s=0.2))
+        await asyncio.sleep(0.05)
+        self.assertEqual(head.state, "queued")
+        self.assertEqual(later.state, "queued")
+        self.assertTrue(all(row["eta_seconds"] is None for row in self.broker.snapshot()["queue"]))
+        for job in (head, later):
+            self.assertEqual((await terminal_events(job))[-1]["state"], "queue_timeout")
+
+    async def test_cancelled_head_unblocks_overlapping_request(self):
+        self.inventory.occupancy = {0: [999999]}
+        await asyncio.sleep(0.03)
+        head = self.broker.submit(self.request((0, 1), gpu_count=2))
+        later = self.broker.submit(self.request((1,)))
+        await asyncio.sleep(0.03)
+        self.assertEqual(later.state, "queued")
+        self.assertTrue(await self.broker.cancel(head.job_id, reason="owned test cancellation"))
+        self.assertEqual((await terminal_events(head))[-1]["state"], "cancelled")
+        self.assertEqual((await terminal_events(later))[-1]["state"], "completed")
+        self.assertEqual(later.gpu_ids, (1,))
+
+    async def test_older_exclusive_waiter_blocks_new_shared_packing_on_its_scope(self):
+        holder = self.broker.submit(dataclasses.replace(
+            spec("import time; time.sleep(.3)", label="holder", mode="shared"),
+            allowed_gpu_ids=(1,)))
+        while (await asyncio.wait_for(holder.events.get(), timeout=3))["type"] != "started":
+            pass
+        exclusive = self.broker.submit(self.request((1,), queue_timeout_s=0.05))
+        shared = self.broker.submit(self.request((1,), mode="shared"))
+        await asyncio.sleep(0.02)
+        self.assertEqual(exclusive.state, "queued")
+        self.assertEqual(shared.state, "queued")
+        self.assertEqual((await terminal_events(exclusive))[-1]["state"], "queue_timeout")
+        self.assertEqual((await terminal_events(shared))[-1]["state"], "completed")
+        self.assertEqual((await terminal_events(holder))[-1]["state"], "completed")
 
     async def asyncSetUp(self):
         self.temp = tempfile.TemporaryDirectory()

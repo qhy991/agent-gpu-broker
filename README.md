@@ -240,3 +240,7 @@ A queued job allocates no cache. A cleanup failure is explicit in the terminal
 receipt and cannot retain the GPU allocation or change the command verdict.
 Container launchers must use container-temporary cache storage or forward a
 mounted broker cache; a cache path in persistent task HOME is not allowed.
+
+### FIFO priority across GPU scopes
+
+Requests stay in one queue. An earlier waiting request blocks later requests whose allowed physical GPU sets overlap it. A blocked broad request also preserves priority across its full set. A request with no GPU restriction covers every managed GPU. Requests with disjoint sets can start independently, so a busy GPU0 does not leave GPU1 idle solely because of queue order. Existing GPU1 requests retain their priority over a later GPU1 request. Queue ETA follows the same scope rule; unavailable occupancy remains unknown in affected scopes.
