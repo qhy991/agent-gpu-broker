@@ -5,12 +5,16 @@ from __future__ import annotations
 import asyncio
 import json
 import stat
+import socket
+import struct
 from pathlib import Path
 from typing import Any
 
 from .broker import GpuBroker, JobSpec
+from .deadline import HostDeadline, monotonic_clock_domain
 
 SCOPED_RUN_OPERATION = "run-scoped"
+DEADLINE_RUN_OPERATION = "run-deadline-v1"
 
 
 class BrokerServer:
@@ -85,8 +89,11 @@ class BrokerServer:
                     {"type": "receipt", "ok": receipt is not None, "receipt": receipt},
                 )
                 return
-            if operation not in {"run", SCOPED_RUN_OPERATION}:
+            if operation not in {"run", SCOPED_RUN_OPERATION, DEADLINE_RUN_OPERATION}:
                 raise ValueError(f"unknown operation: {operation!r}")
+            has_deadline = request.get("host_deadline") is not None
+            if (operation == DEADLINE_RUN_OPERATION) != has_deadline:
+                raise ValueError("host deadline requires run-deadline-v1 with host_deadline")
             has_scope = request.get("allowed_gpu_ids") is not None
             if operation == SCOPED_RUN_OPERATION and not has_scope:
                 raise ValueError("run-scoped requires allowed_gpu_ids")
@@ -94,6 +101,14 @@ class BrokerServer:
                 raise ValueError("GPU-scoped requests require run-scoped")
 
             spec = self._parse_spec(request)
+            if spec.deadline is not None:
+                peer_socket = writer.get_extra_info("socket")
+                if peer_socket is None or not hasattr(socket, "SO_PEERCRED"):
+                    raise ValueError("deadline route requires Linux Unix peer clock verification")
+                peer_pid, _, _ = struct.unpack("3i", peer_socket.getsockopt(
+                    socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")))
+                if monotonic_clock_domain(peer_pid=peer_pid) != spec.deadline.clock_domain:
+                    raise ValueError("deadline peer clock domain differs from broker host clock")
             job = self.broker.submit(spec)
             job_id = job.job_id
             forward = asyncio.create_task(self._forward_events(job.events, writer))
@@ -179,6 +194,13 @@ class BrokerServer:
         allowed = request.get("allowed_gpu_ids")
         if allowed is not None and not isinstance(allowed, list):
             raise ValueError("allowed_gpu_ids must be a list")
+        raw_deadline = request.get("host_deadline")
+        deadline = None
+        if raw_deadline is not None:
+            if not isinstance(raw_deadline, dict) or set(raw_deadline) != {"monotonic_s", "clock_domain"}:
+                raise ValueError("host_deadline requires monotonic_s and clock_domain")
+            deadline = HostDeadline(**raw_deadline)
+            deadline.validate()
         raw_estimate = request.get("estimate_s", 600.0)
         return JobSpec(
             argv=tuple(argv),
@@ -198,6 +220,7 @@ class BrokerServer:
                 None if queue_timeout is None else max(0.01, float(queue_timeout))
             ),
             env=env,
+            deadline=deadline,
         )
 
     @staticmethod

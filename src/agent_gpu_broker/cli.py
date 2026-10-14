@@ -16,7 +16,8 @@ from pathlib import Path
 from typing import Any
 
 from .broker import GpuBroker
-from .server import BrokerServer, SCOPED_RUN_OPERATION
+from .server import BrokerServer, SCOPED_RUN_OPERATION, DEADLINE_RUN_OPERATION
+from .deadline import HostDeadline, monotonic_clock_domain
 
 DEFAULT_SOCKET = Path("/tmp/agent-gpu-broker.sock")
 DEFAULT_STATE_DIR = Path.home() / ".local/share/agent-gpu-broker"
@@ -109,6 +110,8 @@ def _parser() -> argparse.ArgumentParser:
         type=parse_duration,
         default=900.0,
     )
+    run.add_argument("--host-monotonic-deadline", type=float,
+                     help="absolute same-boot Linux CLOCK_MONOTONIC expiry")
     run.add_argument("--env", action="append", default=[], metavar="KEY=VALUE")
     run.add_argument("--allowed-gpus", type=parse_gpu_ids,
                      help="restrict allocation to these managed physical GPU indices")
@@ -301,10 +304,15 @@ def _run(args: argparse.Namespace) -> int:
         return 2
     try:
         env = _parse_env(args.env)
+        deadline = None
+        if getattr(args, "host_monotonic_deadline", None) is not None:
+            deadline = HostDeadline(args.host_monotonic_deadline, monotonic_clock_domain())
+            deadline.validate()
         client, connection = _request(
             args.socket,
             {
-                "op": SCOPED_RUN_OPERATION if getattr(args, "allowed_gpus", None) is not None else "run",
+                "op": DEADLINE_RUN_OPERATION if deadline is not None else (
+                    SCOPED_RUN_OPERATION if getattr(args, "allowed_gpus", None) is not None else "run"),
                 "argv": command,
                 "cwd": str(args.cwd.expanduser().resolve()),
                 "owner": args.owner,
@@ -316,6 +324,7 @@ def _run(args: argparse.Namespace) -> int:
                 "queue_timeout_s": args.queue_timeout,
                 "run_timeout_s": args.run_timeout,
                 "env": env,
+                **({"host_deadline": deadline.value()} if deadline is not None else {}),
             },
         )
     except (OSError, RuntimeError, ValueError) as exc:
