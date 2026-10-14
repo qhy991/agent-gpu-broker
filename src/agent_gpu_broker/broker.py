@@ -24,6 +24,9 @@ LAUNCH_SPEC_SCHEMA = "gpuq.launch-spec.v1"
 ADMISSION_RECEIPT_SCHEMA = "gpuq.admission-receipt.v1"
 
 BROKER_VERSION = __version__
+ALLOCATION_ENVIRONMENT = "gpuq_v1"
+BACKEND = "nvidia"
+OCCUPANCY_SCOPE = "system"
 
 # Jobs that exit this fast with a permission error in their stderr almost
 # always lost a race between admission and the workload's first file access
@@ -490,6 +493,10 @@ class GpuBroker:
         return {
             "version": 2,
             "broker_version": BROKER_VERSION,
+            "allocation_environment": ALLOCATION_ENVIRONMENT,
+            "backend": BACKEND,
+            "occupancy_scope": OCCUPANCY_SCOPE,
+            "external_occupancy": "unknown" if self._probe_error else "observed",
             "instance_id": self._instance_id,
             "updated_at": _utc_now(),
             "probe_error": self._observation_error(now),
@@ -596,13 +603,26 @@ class GpuBroker:
             return
 
         self._probe_error = None
-        while self._queue:
-            job = self._queue[0]
-            gpu_ids = self._try_allocate(job, occupancy)
-            if gpu_ids is None:
-                break
-            self._queue.popleft()
-            self._start_job(job, gpu_ids)
+        retained: deque[Job] = deque()
+        blocked_scopes: set[int] = set()
+        try:
+            while self._queue:
+                job = self._queue[0]
+                eligible = set(self._eligible_gpu_ids(job.spec))
+                if eligible & blocked_scopes:
+                    retained.append(self._queue.popleft())
+                    blocked_scopes.update(eligible)
+                    continue
+                gpu_ids = self._try_allocate(job, occupancy)
+                if gpu_ids is None:
+                    retained.append(self._queue.popleft())
+                    blocked_scopes.update(eligible)
+                    continue
+                self._queue.popleft()
+                self._start_job(job, gpu_ids)
+        finally:
+            retained.extend(self._queue)
+            self._queue = retained
         self._gpu_observation = self._observe_gpus(occupancy)
         self._gpu_observed_at = _utc_now()
         self._gpu_observed_mono = time.monotonic()
@@ -733,6 +753,11 @@ class GpuBroker:
                 **job.spec.env,
                 "CUDA_CACHE_PATH": cuda_cache.name,
                 "CUDA_VISIBLE_DEVICES": ",".join(map(str, job.gpu_ids)),
+                "GPUQ_JOB_ID": job.job_id,
+                "GPUQ_MODE": job.spec.mode,
+                "GPUQ_BACKEND": BACKEND,
+                "GPUQ_DEVICE_IDS": ",".join(map(str, job.gpu_ids)),
+                "GPUQ_OCCUPANCY_SCOPE": OCCUPANCY_SCOPE,
             }
             job.effective_env_sha256 = digest_json(environment)
             self._store.record_admission(job)
@@ -992,13 +1017,15 @@ class GpuBroker:
 
         result: dict[str, float | None] = {}
         queue = list(self._queue)
-        fifo_start: float | None = 0.0
-        for index, job in enumerate(queue):
+        fifo_starts: dict[int, float | None] = dict.fromkeys(self._gpu_ids, 0.0)
+        for job in queue:
             eligible = self._eligible_gpu_ids(job.spec)
+            fifo_start = self._latest_eta(*(fifo_starts[gpu_id] for gpu_id in eligible))
             if job.spec.gpu_count > sum(gpu_id in eligible for gpu_id in virtual):
-                for blocked in queue[index:]:
-                    result[blocked.job_id] = None
-                break
+                result[job.job_id] = None
+                for gpu_id in eligible:
+                    fifo_starts[gpu_id] = None
+                continue
             if job.spec.mode == "exclusive":
                 ready = sorted(
                     (
@@ -1038,7 +1065,8 @@ class GpuBroker:
                         self._eta_end(start, job.spec.estimate_s)
                     )
             result[job.job_id] = start
-            fifo_start = start
+            for gpu_id in eligible:
+                fifo_starts[gpu_id] = start
         return result
 
     @staticmethod

@@ -12,6 +12,12 @@ local schedulers can use its per-card lock directory to avoid co-tenancy.
 
 The exact v0.6.0 A800/B200 admission-receipt qualification is recorded in
 [the qualification report](docs/v0.6.0-admission-receipt-qualification-2026-08-25.md).
+Version 0.6.1 additionally reports the NVIDIA `gpuq_v1` allocation environment
+in status. For every launched job, the broker overwrites caller-supplied
+`GPUQ_JOB_ID`, `GPUQ_MODE`, `GPUQ_BACKEND`, `GPUQ_DEVICE_IDS`,
+`GPUQ_OCCUPANCY_SCOPE`, and `CUDA_VISIBLE_DEVICES` with its own allocation.
+The status declaration applies to this NVIDIA broker; it does not qualify a
+different backend or a running v0.6.0 daemon.
 
 Version 0.7 adds optional `gpuq run --allowed-gpus 0,1` job constraints. These
 are physical indices from the site's permitted pool; the daemon rejects invalid
@@ -234,3 +240,7 @@ A queued job allocates no cache. A cleanup failure is explicit in the terminal
 receipt and cannot retain the GPU allocation or change the command verdict.
 Container launchers must use container-temporary cache storage or forward a
 mounted broker cache; a cache path in persistent task HOME is not allowed.
+
+### FIFO priority across GPU scopes
+
+Requests stay in one queue. An earlier waiting request blocks later requests whose allowed physical GPU sets overlap it. A blocked broad request also preserves priority across its full set. A request with no GPU restriction covers every managed GPU. Requests with disjoint sets can start independently, so a busy GPU0 does not leave GPU1 idle solely because of queue order. Existing GPU1 requests retain their priority over a later GPU1 request. Queue ETA follows the same scope rule; unavailable occupancy remains unknown in affected scopes.
