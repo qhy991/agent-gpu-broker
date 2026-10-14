@@ -605,19 +605,24 @@ class GpuBroker:
         self._probe_error = None
         retained: deque[Job] = deque()
         blocked_scopes: set[int] = set()
-        for job in self._queue:
-            eligible = set(self._eligible_gpu_ids(job.spec))
-            if eligible & blocked_scopes:
-                retained.append(job)
-                blocked_scopes.update(eligible)
-                continue
-            gpu_ids = self._try_allocate(job, occupancy)
-            if gpu_ids is None:
-                retained.append(job)
-                blocked_scopes.update(eligible)
-                continue
-            self._start_job(job, gpu_ids)
-        self._queue = retained
+        try:
+            while self._queue:
+                job = self._queue[0]
+                eligible = set(self._eligible_gpu_ids(job.spec))
+                if eligible & blocked_scopes:
+                    retained.append(self._queue.popleft())
+                    blocked_scopes.update(eligible)
+                    continue
+                gpu_ids = self._try_allocate(job, occupancy)
+                if gpu_ids is None:
+                    retained.append(self._queue.popleft())
+                    blocked_scopes.update(eligible)
+                    continue
+                self._queue.popleft()
+                self._start_job(job, gpu_ids)
+        finally:
+            retained.extend(self._queue)
+            self._queue = retained
         self._gpu_observation = self._observe_gpus(occupancy)
         self._gpu_observed_at = _utc_now()
         self._gpu_observed_mono = time.monotonic()

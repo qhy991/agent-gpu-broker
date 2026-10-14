@@ -8,6 +8,8 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
+import agent_gpu_broker.broker as broker_module
 
 from agent_gpu_broker import __version__
 from agent_gpu_broker.broker import GpuBroker, admission_receipt_value, launch_spec_value
@@ -106,6 +108,28 @@ class GpuScopeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await terminal_events(exclusive))[-1]["state"], "queue_timeout")
         self.assertEqual((await terminal_events(shared))[-1]["state"], "completed")
         self.assertEqual((await terminal_events(holder))[-1]["state"], "completed")
+
+    async def test_later_allocation_error_does_not_replay_an_already_started_worker(self):
+        marker = self.root / "worker-executions"
+        code = "from pathlib import Path; import time; p=Path(%r); f=p.open('a'); f.write('once\\n'); f.close(); time.sleep(.12)" % str(marker)
+        original = broker_module.try_card_lock
+        failed = False
+        def transient(gpu_id, lock_dir):
+            nonlocal failed
+            if gpu_id == 1 and not failed:
+                failed = True
+                raise OSError("transient lock-file error")
+            return original(gpu_id, lock_dir)
+        with patch.object(broker_module, "try_card_lock", transient):
+            first = self.broker.submit(dataclasses.replace(spec(code, label="once"), allowed_gpu_ids=(0,)))
+            second = self.broker.submit(self.request((1,)))
+            for job in (first, second):
+                self.assertEqual((await terminal_events(job))[-1]["state"], "completed")
+            await asyncio.sleep(0.15)
+        self.assertTrue(failed)
+        self.assertEqual(marker.read_text().splitlines(), ["once"])
+        self.assertEqual(self.broker.snapshot()["queue"], [])
+        self.assertEqual(self.broker.snapshot()["running"], [])
 
     async def asyncSetUp(self):
         self.temp = tempfile.TemporaryDirectory()
