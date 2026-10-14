@@ -91,14 +91,19 @@ class BrokerTests(unittest.IsolatedAsyncioTestCase):
             request = spec(code, label=f"cache-{index}", run_timeout_s=.15 if index == 2 else 2)
             request.env['CUDA_CACHE_PATH'] = str(Path(self.temp.name)/'persistent-do-not-use')
             job = self.broker.submit(request)
+            prefix = []
             if index == 3:
-                while job.process is None: await asyncio.sleep(.005)
-                await asyncio.sleep(.03)
+                while True:
+                    event = await asyncio.wait_for(job.events.get(), timeout=3)
+                    prefix.append(event)
+                    if event['type'] == 'output' and event['stream'] == 'stdout':
+                        break
+                    self.assertNotEqual(event['type'], 'finished')
                 await self.broker.cancel(job.job_id, reason='cache cancellation fixture')
-            events = await terminal_events(job)
+            events = prefix + await terminal_events(job)
             output = ''.join(e['data'] for e in events if e['type']=='output' and e['stream']=='stdout').strip()
             cache = Path(output)
-            self.assertTrue(cache.is_absolute())
+            self.assertTrue(cache.is_absolute(), f"cache fixture index={index}, state={events[-1]['state']}")
             self.assertFalse(cache.exists())
             self.assertEqual(events[-1]['cuda_cache_cleanup'], {'removed': True})
             self.assertEqual(events[-1]['state'], ['completed','failed','run_timeout','cancelled'][index])

@@ -16,7 +16,8 @@ from pathlib import Path
 from typing import Any
 
 from .broker import GpuBroker
-from .server import BrokerServer, SCOPED_RUN_OPERATION
+from .server import BrokerServer, SCOPED_RUN_OPERATION, DEADLINE_RUN_OPERATION
+from .deadline import HostDeadline, monotonic_clock_domain
 
 DEFAULT_SOCKET = Path("/tmp/agent-gpu-broker.sock")
 DEFAULT_STATE_DIR = Path.home() / ".local/share/agent-gpu-broker"
@@ -109,6 +110,8 @@ def _parser() -> argparse.ArgumentParser:
         type=parse_duration,
         default=900.0,
     )
+    run.add_argument("--host-monotonic-deadline", type=float,
+                     help="absolute same-boot Linux CLOCK_MONOTONIC expiry")
     run.add_argument("--env", action="append", default=[], metavar="KEY=VALUE")
     run.add_argument("--allowed-gpus", type=parse_gpu_ids,
                      help="restrict allocation to these managed physical GPU indices")
@@ -116,6 +119,11 @@ def _parser() -> argparse.ArgumentParser:
         "--receipt-out",
         type=Path,
         help="atomically write the started job's broker-issued admission receipt",
+    )
+    run.add_argument(
+        "--result-out",
+        type=Path,
+        help="atomically write the exact received broker finished event",
     )
     run.add_argument("argv", nargs=argparse.REMAINDER)
     return parser
@@ -300,11 +308,21 @@ def _run(args: argparse.Namespace) -> int:
         print("gpu-run: missing command after --", file=sys.stderr)
         return 2
     try:
+        result_out = getattr(args, "result_out", None)
+        if result_out is not None:
+            result_out = result_out.expanduser().resolve()
+            if args.receipt_out is not None and result_out == args.receipt_out.expanduser().resolve():
+                raise ValueError("--receipt-out and --result-out must use distinct paths")
         env = _parse_env(args.env)
+        deadline = None
+        if getattr(args, "host_monotonic_deadline", None) is not None:
+            deadline = HostDeadline(args.host_monotonic_deadline, monotonic_clock_domain())
+            deadline.validate()
         client, connection = _request(
             args.socket,
             {
-                "op": SCOPED_RUN_OPERATION if getattr(args, "allowed_gpus", None) is not None else "run",
+                "op": DEADLINE_RUN_OPERATION if deadline is not None else (
+                    SCOPED_RUN_OPERATION if getattr(args, "allowed_gpus", None) is not None else "run"),
                 "argv": command,
                 "cwd": str(args.cwd.expanduser().resolve()),
                 "owner": args.owner,
@@ -316,6 +334,7 @@ def _run(args: argparse.Namespace) -> int:
                 "queue_timeout_s": args.queue_timeout,
                 "run_timeout_s": args.run_timeout,
                 "env": env,
+                **({"host_deadline": deadline.value()} if deadline is not None else {}),
             },
         )
     except (OSError, RuntimeError, ValueError) as exc:
@@ -363,6 +382,14 @@ def _run(args: argparse.Namespace) -> int:
                 stream.write(event["data"])
                 stream.flush()
             elif kind == "finished":
+                if result_out is not None:
+                    try:
+                        if job_id is None or event.get("job_id") != job_id:
+                            raise ValueError("finished event does not match the accepted job_id")
+                        _atomic_json(result_out, event)
+                    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                        print(f"gpu-run: result export failed: {exc}", file=sys.stderr)
+                        return 1
                 if event.get("warning"):
                     _note(f"warning: {event['warning']}")
                 reason = f" reason={event['reason']}" if event.get("reason") else ""

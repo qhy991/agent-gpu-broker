@@ -240,3 +240,24 @@ A queued job allocates no cache. A cleanup failure is explicit in the terminal
 receipt and cannot retain the GPU allocation or change the command verdict.
 Container launchers must use container-temporary cache storage or forward a
 mounted broker cache; a cache path in persistent task HOME is not allowed.
+
+### Terminal result export
+
+`gpu-run --result-out PATH` atomically writes the complete received broker
+`finished` event, including unknown fields, before returning the broker exit
+code. It works when a queued job expires without a `started` event or admission
+receipt. This optional output path is local CLI policy and does not enter the
+request or admission digests. Worker stdout and stderr retain their existing
+behavior.
+
+Only an observed terminal event for the accepted job is exported. Refusal,
+connection loss, malformed JSON, or client interruption produces no terminal
+file. Cancellation acknowledgement after interruption is not a terminal result.
+Export failure returns nonzero and never retries the job or retrieves a result
+through another operation. The broker's stored result remains authoritative.
+
+The existing atomic writer replaces a destination file. For invocation custody,
+use a fresh unique path, verify it is absent before submission, and bind the
+exported `job_id` and admission digests to this invocation. Do not accept an old
+file after CLI failure. `--receipt-out` and `--result-out` must resolve to distinct
+paths; the CLI rejects a collision before submitting the job.

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from .deadline import HostDeadline
+
 import asyncio
 import hashlib
 import json
@@ -102,7 +104,7 @@ def _sha256_file(path: Path) -> str:
 
 def launch_spec_value(spec: "JobSpec") -> dict[str, Any]:
     """Canonical client-controlled launch and scheduling request."""
-    return {
+    value = {
         "schema": LAUNCH_SPEC_SCHEMA,
         "argv": list(spec.argv),
         "cwd": spec.cwd,
@@ -116,6 +118,10 @@ def launch_spec_value(spec: "JobSpec") -> dict[str, Any]:
         "run_timeout_s": spec.run_timeout_s,
         "env": dict(spec.env),
     }
+
+    if spec.deadline is not None:
+        value["host_deadline"] = spec.deadline.value()
+    return value
 
 
 def _resolve_executable(spec: "JobSpec") -> Path | None:
@@ -159,6 +165,8 @@ def _static_admission(job: "Job") -> dict[str, Any]:
         "env_keys": sorted(job.spec.env),
         "env_sha256": digest_json(dict(job.spec.env)),
         "launch_spec_sha256": digest_json(launch_spec),
+        **({"host_deadline": job.spec.deadline.value()}
+           if job.spec.deadline is not None else {}),
         "resolved_executable": str(executable),
         "executable_sha256": _sha256_file(executable),
     }
@@ -189,6 +197,7 @@ class JobSpec:
     queue_timeout_s: float | None
     env: dict[str, str] = field(default_factory=dict)
     allowed_gpu_ids: tuple[int, ...] | None = None
+    deadline: HostDeadline | None = None
 
 
 @dataclass
@@ -254,6 +263,8 @@ class StateStore:
                 "estimate_s": job.spec.estimate_s,
                 "run_timeout_s": job.spec.run_timeout_s,
                 "queue_timeout_s": job.spec.queue_timeout_s,
+                **({"host_deadline": job.spec.deadline.value()}
+                   if job.spec.deadline is not None else {}),
                 "admission_launch_spec_sha256": (
                     job.admission.get("launch_spec_sha256")
                     if job.admission is not None
@@ -385,6 +396,10 @@ class GpuBroker:
         self._write_status()
 
     def submit(self, spec: JobSpec) -> Job:
+        if spec.deadline is not None:
+            if not isinstance(spec.deadline, HostDeadline):
+                raise ValueError("deadline must be HostDeadline")
+            spec.deadline.validate()
         if self._closed:
             raise RuntimeError("broker is closed")
         if not spec.argv:
@@ -467,9 +482,14 @@ class GpuBroker:
             self._wakeup.set()
             return True
         if job.task is not None:
-            job.cancel_reason = reason
-            job.task.cancel()
-            await asyncio.gather(job.task, return_exceptions=True)
+            if job.spec.deadline is None or job.cancel_reason is None:
+                job.cancel_reason = reason
+                job.task.cancel()
+            completion = asyncio.gather(job.task, return_exceptions=True)
+            if job.spec.deadline is not None:
+                await asyncio.shield(completion)
+            else:
+                await completion
             # A task cancelled before its coroutine first runs never reaches
             # _execute's finally block. Close that narrow allocation race here.
             if job.job_id in self._jobs:
@@ -579,18 +599,26 @@ class GpuBroker:
             return "GPU occupancy observation is stale"
         return None
 
+    @staticmethod
+    def _queued_expiration(job: Job, now: float) -> tuple[str, str] | None:
+        limit = job.spec.queue_timeout_s
+        queue_end = job.submitted_mono + limit if limit is not None else float("inf")
+        deadline_end = (job.spec.deadline.monotonic_s
+                        if job.spec.deadline is not None else float("inf"))
+        if now < min(queue_end, deadline_end):
+            return None
+        if deadline_end <= queue_end:
+            return "phase_deadline", "host monotonic phase deadline expired before launch"
+        return "queue_timeout", f"queue wait exceeded {limit:g}s"
+
     def _expire_queued_jobs(self) -> None:
         now = time.monotonic()
         retained: deque[Job] = deque()
         for job in self._queue:
-            limit = job.spec.queue_timeout_s
-            if limit is not None and now - job.submitted_mono >= limit:
-                self._finish(
-                    job,
-                    state="queue_timeout",
-                    exit_code=124,
-                    reason=f"queue wait exceeded {limit:g}s",
-                )
+            expired = self._queued_expiration(job, now)
+            if expired is not None:
+                state, reason = expired
+                self._finish(job, state=state, exit_code=124, reason=reason)
             else:
                 retained.append(job)
         self._queue = retained
@@ -605,6 +633,13 @@ class GpuBroker:
         self._probe_error = None
         while self._queue:
             job = self._queue[0]
+            expired = (self._queued_expiration(job, time.monotonic())
+                       if job.spec.deadline is not None else None)
+            if expired is not None:
+                self._queue.popleft()
+                state, reason = expired
+                self._finish(job, state=state, exit_code=124, reason=reason)
+                continue
             gpu_ids = self._try_allocate(job, occupancy)
             if gpu_ids is None:
                 break
@@ -748,6 +783,11 @@ class GpuBroker:
             }
             job.effective_env_sha256 = digest_json(environment)
             self._store.record_admission(job)
+            if (job.spec.deadline is not None
+                    and time.monotonic() >= job.spec.deadline.monotonic_s):
+                state, exit_code = "phase_deadline", 124
+                reason = "host monotonic phase deadline expired before launch"
+                return
             spawn = asyncio.create_task(
                 asyncio.create_subprocess_exec(
                     *job.spec.argv,
@@ -787,28 +827,52 @@ class GpuBroker:
                 asyncio.create_task(self._pump(job, "stdout", job.process.stdout)),
                 asyncio.create_task(self._pump(job, "stderr", job.process.stderr)),
             ]
+            remaining = (job.spec.deadline.monotonic_s - time.monotonic()
+                         if job.spec.deadline is not None else None)
+            deadline_limited = remaining is not None and remaining <= job.spec.run_timeout_s
+            wait_limit = max(0.0, remaining) if deadline_limited else job.spec.run_timeout_s
             try:
                 exit_code = await asyncio.wait_for(
-                    job.process.wait(), timeout=job.spec.run_timeout_s
+                    job.process.wait(), timeout=wait_limit
                 )
-                state = "completed" if exit_code == 0 else "failed"
+                if (job.spec.deadline is not None
+                        and time.monotonic() >= job.spec.deadline.monotonic_s):
+                    state, exit_code = "phase_deadline", 124
+                    reason = "host monotonic phase deadline expired before completion was observed"
+                    await self._terminate(job.process, kill_group=True)
+                else:
+                    state = "completed" if exit_code == 0 else "failed"
             except asyncio.TimeoutError:
-                reason = f"run exceeded {job.spec.run_timeout_s:g}s"
-                await self._terminate(job.process)
-                state = "run_timeout"
+                reason = ("host monotonic phase deadline expired while running"
+                          if deadline_limited else f"run exceeded {job.spec.run_timeout_s:g}s")
+                state = "phase_deadline" if deadline_limited else "run_timeout"
                 exit_code = 124
-            await asyncio.gather(*output_tasks, return_exceptions=True)
+                await self._terminate(job.process, kill_group=job.spec.deadline is not None)
+            drained = asyncio.gather(*output_tasks, return_exceptions=True)
+            if job.spec.deadline is not None and state in {"completed", "failed"}:
+                try:
+                    await asyncio.wait_for(asyncio.shield(drained), timeout=max(
+                        0.0, job.spec.deadline.monotonic_s - time.monotonic()))
+                except asyncio.TimeoutError:
+                    state, exit_code = "phase_deadline", 124
+                    reason = "host monotonic phase deadline expired while draining output"
+                    await self._terminate(job.process, kill_group=True)
+                    await drained
+            else:
+                await drained
+            if job.spec.deadline is not None and state in {"completed", "failed"}:
+                await self._terminate(job.process, kill_group=True)
         except asyncio.CancelledError:
-            reason = job.cancel_reason or "job cancelled"
+            if job.spec.deadline is None or state not in {"phase_deadline", "run_timeout"}:
+                reason = job.cancel_reason or "job cancelled"
+                state, exit_code = "cancelled", 130
             if job.process is not None:
-                await self._terminate(job.process)
+                await self._terminate(job.process, kill_group=job.spec.deadline is not None)
             await asyncio.gather(*output_tasks, return_exceptions=True)
-            state = "cancelled"
-            exit_code = 130
         except Exception as exc:  # command launch and broker-side failures
             reason = str(exc)
             if job.process is not None and job.process.returncode is None:
-                await self._terminate(job.process)
+                await self._terminate(job.process, kill_group=job.spec.deadline is not None)
             await asyncio.gather(*output_tasks, return_exceptions=True)
         finally:
             runtime_ended_mono = time.monotonic()
@@ -870,7 +934,20 @@ class GpuBroker:
                 },
             )
 
-    async def _terminate(self, process: asyncio.subprocess.Process) -> None:
+    async def _terminate(self, process: asyncio.subprocess.Process, *, kill_group: bool = False) -> None:
+        if kill_group:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                await process.wait()
+                return
+            await asyncio.sleep(self._terminate_grace_s)
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            await process.wait()
+            return
         if process.returncode is not None:
             return
         try:
@@ -948,6 +1025,10 @@ class GpuBroker:
             "broker_version": BROKER_VERSION,
             "broker_instance_id": self._instance_id,
         }
+        if job.spec.deadline is not None:
+            result["host_deadline"] = job.spec.deadline.value()
+            result["completed_monotonic_s"] = completed_mono
+            result["process_exit_code"] = job.process.returncode if job.process is not None else None
         if cache_cleanup is not None:
             result["cuda_cache_cleanup"] = cache_cleanup
         admission = admission_receipt_value(job)
