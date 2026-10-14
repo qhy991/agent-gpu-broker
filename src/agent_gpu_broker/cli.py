@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import getpass
 import json
+import math
 import os
 import signal
 import socket
@@ -15,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from .broker import GpuBroker
-from .server import BrokerServer
+from .server import BrokerServer, SCOPED_RUN_OPERATION
 
 DEFAULT_SOCKET = Path("/tmp/agent-gpu-broker.sock")
 DEFAULT_STATE_DIR = Path.home() / ".local/share/agent-gpu-broker"
@@ -33,7 +34,7 @@ def parse_duration(value: str) -> float:
         result = float(text) * multiplier
     except ValueError as exc:
         raise argparse.ArgumentTypeError(f"invalid duration: {value}") from exc
-    if result <= 0:
+    if not math.isfinite(result) or result <= 0:
         raise argparse.ArgumentTypeError("duration must be positive")
     return result
 
@@ -51,6 +52,16 @@ def positive_int(value: str) -> int:
         raise argparse.ArgumentTypeError(f"invalid integer: {value}") from exc
     if result < 1:
         raise argparse.ArgumentTypeError("value must be positive")
+    return result
+
+
+def parse_gpu_ids(value: str) -> list[int]:
+    parts = value.split(",")
+    if not parts or any(not part.strip().isdigit() for part in parts):
+        raise argparse.ArgumentTypeError("allowed GPUs must be comma-separated physical indices")
+    result = [int(part.strip()) for part in parts]
+    if len(set(result)) != len(result):
+        raise argparse.ArgumentTypeError("allowed GPUs must be distinct")
     return result
 
 
@@ -99,6 +110,8 @@ def _parser() -> argparse.ArgumentParser:
         default=900.0,
     )
     run.add_argument("--env", action="append", default=[], metavar="KEY=VALUE")
+    run.add_argument("--allowed-gpus", type=parse_gpu_ids,
+                     help="restrict allocation to these managed physical GPU indices")
     run.add_argument(
         "--receipt-out",
         type=Path,
@@ -189,6 +202,10 @@ def _status(args: argparse.Namespace) -> int:
     )
     if snapshot.get("probe_error"):
         print(f"probe error: {snapshot['probe_error']}")
+    print(
+        f"GPU observation at={snapshot.get('gpu_observed_at') or 'unknown'} "
+        f"age_seconds={snapshot.get('gpu_observation_age_seconds')}"
+    )
     print("GPUS")
     for gpu in snapshot["gpus"]:
         jobs = gpu.get("jobs", [])
@@ -216,7 +233,7 @@ def _status(args: argparse.Namespace) -> int:
         print(
             f"  {job['position']}. {job['job_id']} owner={job['owner']} "
             f"label={job['label']} mode={job['mode']} gpus={job['gpu_count']} "
-            f"eta={eta}"
+            f"allowed={job.get('allowed_gpu_ids', 'unknown')} eta={eta}"
         )
     return 0
 
@@ -287,13 +304,14 @@ def _run(args: argparse.Namespace) -> int:
         client, connection = _request(
             args.socket,
             {
-                "op": "run",
+                "op": SCOPED_RUN_OPERATION if getattr(args, "allowed_gpus", None) is not None else "run",
                 "argv": command,
                 "cwd": str(args.cwd.expanduser().resolve()),
                 "owner": args.owner,
                 "label": args.label,
                 "mode": args.mode,
                 "gpu_count": args.gpu_count,
+                "allowed_gpu_ids": getattr(args, "allowed_gpus", None),
                 "estimate_s": args.estimate,
                 "queue_timeout_s": args.queue_timeout,
                 "run_timeout_s": args.run_timeout,

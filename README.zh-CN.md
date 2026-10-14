@@ -1,6 +1,23 @@
 # Agent GPU Broker
 
+0.7 新增可选 `gpuq run --allowed-gpus 0,1` 作业范围，编号来自站点允许的物理
+设备池。daemon 拒绝无效或无法满足的范围，独占与共享打包都不会分配范围外设备；
+准确范围绑定到启动身份和 admission 回执。不传此参数的旧请求保持受管理设备池
+默认行为。候选的 CPU 测试不能把历史 0.6 设备资格结论延伸到 0.7。
+带范围请求在同一 FIFO 提交路径使用 `op=run-scoped`，使 0.6 server 在准入前拒绝，
+避免旧 JSON 解析器忽略新字段后错误地启动到范围外设备。
+
 简体中文 | [English](README.md)
+
+## CUDA 缓存生命周期
+
+broker 为每个开始执行的作业分配唯一 `CUDA_CACHE_PATH`，替换继承或请求中的
+缓存路径；实际环境摘要绑定到 admission 回执，环境值不写入回执。排队作业不创建
+缓存。作业内部继续使用自己的缓存与 warmup，不与其他作业共享已预热缓存。
+成功、失败、执行超时或取消后，broker 回收进程、释放 GPU，再删除自己的临时驱动
+缓存；GPU 执行时长不包含清理时间。候选、日志、profiler 报告和回执不属于清理目标。
+清理失败在终态 `cuda_cache_cleanup` 中明确记录，不改变任务结果或滞留分配。
+容器启动器应使用容器内临时缓存，或转发挂载的 broker 缓存，避免写入持久任务 HOME。
 
 `agent-gpu-broker` 是一个面向编程 Agent 的单机全局 GPU 队列。Agent 只需保持
 一条普通的 `gpu-run` 命令运行，broker 就会在同一次调用中持续返回队列位置、
@@ -155,6 +172,21 @@ ETA 是根据任务声明的 `--estimate`、GPU 数量、共享槽位和正在�
 计算，但依赖该服务结束的后续任务会显示 `eta=unknown`，而不是伪造一个数月后的
 时间。有限任务超过其声明 estimate 后，依赖它的 ETA 也会转为 `unknown`；逾期进程
 不会被假定为立即结束。
+
+## GPU 探测健康状态
+
+每次 `nvidia-smi` 有 10 秒限时；超时或取消会终止并回收该探测子进程。探测失败
+不释放已有作业的 GPU 租约；调度器仍处理队列超时，并在下一轮正常轮询重试。
+单次调度异常会被报告，不会让整个循环静默退出。
+
+`gpuq status` 输出最后成功探测时间 `gpu_observed_at`，以及基于 monotonic
+时钟的 `gpu_observation_age_seconds`。`updated_at` 仅代表状态响应时间。
+超过探测限时加两个轮询周期仍无成功观察时，`probe_error` 报告陈旧，ETA 为
+unknown。即使旧 GPU 行仍写 idle，也不能把未知或陈旧观察解释为空闲。
+
+队列同时展示 `allowed_gpu_ids`，其中 `null` 表示受管理设备池。限定卡队首
+可能在其他卡空闲时挡住后面的不限卡工作；ETA 也遵循这条 FIFO 顺序。本轮不增加
+backfill，也不改变分配策略。
 
 ## Broker admission receipt
 

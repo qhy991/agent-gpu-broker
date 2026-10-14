@@ -10,6 +10,8 @@ from typing import Any
 
 from .broker import GpuBroker, JobSpec
 
+SCOPED_RUN_OPERATION = "run-scoped"
+
 
 class BrokerServer:
     def __init__(self, broker: GpuBroker, socket_path: Path) -> None:
@@ -83,8 +85,13 @@ class BrokerServer:
                     {"type": "receipt", "ok": receipt is not None, "receipt": receipt},
                 )
                 return
-            if operation != "run":
+            if operation not in {"run", SCOPED_RUN_OPERATION}:
                 raise ValueError(f"unknown operation: {operation!r}")
+            has_scope = request.get("allowed_gpu_ids") is not None
+            if operation == SCOPED_RUN_OPERATION and not has_scope:
+                raise ValueError("run-scoped requires allowed_gpu_ids")
+            if operation == "run" and has_scope:
+                raise ValueError("GPU-scoped requests require run-scoped")
 
             spec = self._parse_spec(request)
             job = self.broker.submit(spec)
@@ -124,10 +131,11 @@ class BrokerServer:
             if job_id is not None:
                 await self.broker.cancel(job_id, reason="client handler failed")
         finally:
-            writer.close()
             try:
+                writer.close()
                 await writer.wait_closed()
             except (BrokenPipeError, ConnectionResetError, OSError):
+                # The peer is already gone; nothing left to clean up.
                 pass
 
     async def _forward_events(
@@ -168,6 +176,9 @@ class BrokerServer:
         ):
             raise ValueError("gpu_count must be a positive integer")
         queue_timeout = request.get("queue_timeout_s")
+        allowed = request.get("allowed_gpu_ids")
+        if allowed is not None and not isinstance(allowed, list):
+            raise ValueError("allowed_gpu_ids must be a list")
         raw_estimate = request.get("estimate_s", 600.0)
         return JobSpec(
             argv=tuple(argv),
@@ -176,6 +187,7 @@ class BrokerServer:
             label=label.strip(),
             mode=mode,
             gpu_count=gpu_count,
+            allowed_gpu_ids=tuple(allowed) if allowed is not None else None,
             estimate_s=(
                 None
                 if raw_estimate is None
