@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from .broker import GpuBroker
+from .gpu import BackendId, inventory_for
 from .server import BrokerServer, SCOPED_RUN_OPERATION
 
 DEFAULT_SOCKET = Path("/tmp/agent-gpu-broker.sock")
@@ -74,6 +75,8 @@ def _parser() -> argparse.ArgumentParser:
     serve.add_argument("--state-dir", type=Path, default=DEFAULT_STATE_DIR)
     serve.add_argument("--lock-dir", type=Path, default=DEFAULT_LOCK_DIR)
     serve.add_argument("--gpus", help="comma-separated physical GPU indices")
+    serve.add_argument("--backend", choices=[backend.value for backend in BackendId],
+                       default=BackendId.NVIDIA.value, help="device inventory and runtime backend")
     serve.add_argument("--shared-capacity", type=positive_int, default=2)
     serve.add_argument("--poll-interval", type=parse_duration, default=2.0)
     serve.add_argument("--heartbeat", type=parse_duration, default=30.0)
@@ -147,6 +150,7 @@ async def _serve(args: argparse.Namespace) -> int:
             int(value.strip()) for value in args.gpus.split(",") if value.strip()
         ]
     broker = GpuBroker(
+        inventory=inventory_for(BackendId(args.backend)),
         state_dir=args.state_dir.expanduser(),
         lock_dir=args.lock_dir,
         gpu_ids=gpu_ids,

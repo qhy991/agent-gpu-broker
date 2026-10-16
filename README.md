@@ -16,8 +16,8 @@ Version 0.6.1 additionally reports the NVIDIA `gpuq_v1` allocation environment
 in status. For every launched job, the broker overwrites caller-supplied
 `GPUQ_JOB_ID`, `GPUQ_MODE`, `GPUQ_BACKEND`, `GPUQ_DEVICE_IDS`,
 `GPUQ_OCCUPANCY_SCOPE`, and `CUDA_VISIBLE_DEVICES` with its own allocation.
-The status declaration applies to this NVIDIA broker; it does not qualify a
-different backend or a running v0.6.0 daemon.
+That historical qualification applies to NVIDIA and does not qualify MetaX or a
+running v0.6.0 daemon.
 
 Version 0.7 adds optional `gpuq run --allowed-gpus 0,1` job constraints. These
 are physical indices from the site's permitted pool; the daemon rejects invalid
@@ -76,8 +76,32 @@ bin/gpuq serve \
 ```
 
 Use `--gpus 1,2` to constrain an experiment to selected physical cards. Without
-it, the broker discovers every NVIDIA GPU and still skips cards that are occupied
-or locked by another process.
+it, the broker discovers every GPU on the selected backend and skips cards that
+are occupied or locked by another process. The default backend is `nvidia`.
+
+For MetaX, select the backend when starting the daemon:
+
+```bash
+bin/gpuq serve --backend metax --gpus 0,1,2,3
+```
+
+One inventory owns backend identity, discovery, occupancy, and child selectors.
+MetaX uses `mx-smi --list` and `mx-smi --show-all-process`. The parser requires
+complete reports and treats device file holders as occupied even at 0 MiB.
+Unknown formats, missing devices, and attached-count changes block allocation.
+The daemon fixes its physical device set at startup; investigate topology changes
+before restarting it.
+
+MetaX overwrites both `MACA_VISIBLE_DEVICES` and `CUDA_VISIBLE_DEVICES` with the
+allocated physical IDs in order, after inherited and request environment values.
+Status and `GPUQ_BACKEND` report `metax`. `GPUQ_DEVICE_IDS` retains physical IDs.
+The v1 admission receipt schema is unchanged. CPU tests establish parser and
+broker behavior, not device isolation or framework execution. Before deployment,
+qualify occupancy under the actual service identity and namespace, then verify
+native device count and PCI mapping through the actual child or container path.
+Container launchers must forward both selectors; the CUDA Docker `--gpus` route
+does not establish MACA isolation. Torch execution requires separate admission.
+See the [deployment guide](docs/root-deployment.md#metax-deployment).
 
 For a single Unix account with the repository at `~/agent-gpu-broker`, install
 the checked-in user service with:
@@ -138,7 +162,7 @@ immediately.
 
 ## GPU probe health
 
-Each `nvidia-smi` call has a 10-second timeout; timeout/cancellation kills and
+Each `nvidia-smi` or `mx-smi` call has a 10-second timeout; timeout/cancellation kills and
 reaps that probe process. Probe failure does not release active job allocations.
 The scheduler keeps expiring queued requests and retries the next normal poll.
 A single scheduler exception is reported without terminating the loop.
@@ -229,7 +253,7 @@ python -m unittest discover -s tests -v
 
 ## CUDA cache lifecycle
 
-The broker supplies a unique `CUDA_CACHE_PATH` for each started job, including
+On NVIDIA, the broker supplies a unique `CUDA_CACHE_PATH` for each started job, including
 agent-authored launchers. It replaces inherited/client cache paths; the effective
 environment digest binds the actual choice without publishing environment values.
 The CUDA context and warmup run inside that one job. After completion, failure,
@@ -240,6 +264,7 @@ A queued job allocates no cache. A cleanup failure is explicit in the terminal
 receipt and cannot retain the GPU allocation or change the command verdict.
 Container launchers must use container-temporary cache storage or forward a
 mounted broker cache; a cache path in persistent task HOME is not allowed.
+The MetaX backend does not create this cache or emit `cuda_cache_cleanup`.
 
 ### FIFO priority across GPU scopes
 

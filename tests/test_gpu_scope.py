@@ -8,6 +8,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 import agent_gpu_broker.broker as broker_module
 
@@ -73,16 +74,26 @@ class GpuScopeTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual((await terminal_events(job))[-1]["state"], "cancelled")
 
     async def test_unscoped_multi_gpu_request_retains_priority(self):
-        self.inventory.occupancy = {0: [999999]}
-        await asyncio.sleep(0.03)
-        head = self.broker.submit(self.request(None, gpu_count=3, queue_timeout_s=0.2))
-        later = self.broker.submit(self.request((1,), queue_timeout_s=0.2))
-        await asyncio.sleep(0.05)
-        self.assertEqual(head.state, "queued")
-        self.assertEqual(later.state, "queued")
-        self.assertTrue(all(row["eta_seconds"] is None for row in self.broker.snapshot()["queue"]))
-        for job in (head, later):
-            self.assertEqual((await terminal_events(job))[-1]["state"], "queue_timeout")
+        now = 0.0
+        with patch.object(broker_module, "time", SimpleNamespace(monotonic=lambda: now)):
+            self.inventory.occupancy = {0: [999999]}
+            head = self.broker.submit(self.request(None, gpu_count=3, queue_timeout_s=0.2))
+            later = self.broker.submit(self.request((1,), queue_timeout_s=0.2))
+            now = 0.05
+            self.broker._expire_queued_jobs()
+            await self.broker._schedule_jobs()
+            self.assertEqual([head.state, later.state], ["queued", "queued"])
+            self.assertEqual(self.broker.snapshot()["running"], [])
+            self.assertTrue(all(row["eta_seconds"] is None
+                                for row in self.broker.snapshot()["queue"]))
+            now = 0.2
+            self.broker._expire_queued_jobs()
+            await self.broker._schedule_jobs()
+            for job in (head, later):
+                events = await terminal_events(job)
+                self.assertEqual(events[-1]["state"], "queue_timeout")
+                self.assertEqual(events[-1]["exit_code"], 124)
+                self.assertFalse(any(event["type"] == "started" for event in events))
 
     async def test_cancelled_head_unblocks_overlapping_request(self):
         self.inventory.occupancy = {0: [999999]}
@@ -97,19 +108,31 @@ class GpuScopeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(later.gpu_ids, (1,))
 
     async def test_older_exclusive_waiter_blocks_new_shared_packing_on_its_scope(self):
-        holder = self.broker.submit(dataclasses.replace(
-            spec("import time; time.sleep(.3)", label="holder", mode="shared"),
-            allowed_gpu_ids=(1,)))
-        while (await asyncio.wait_for(holder.events.get(), timeout=3))["type"] != "started":
-            pass
-        exclusive = self.broker.submit(self.request((1,), queue_timeout_s=0.05))
-        shared = self.broker.submit(self.request((1,), mode="shared"))
-        await asyncio.sleep(0.02)
-        self.assertEqual(exclusive.state, "queued")
-        self.assertEqual(shared.state, "queued")
-        self.assertEqual((await terminal_events(exclusive))[-1]["state"], "queue_timeout")
-        self.assertEqual((await terminal_events(shared))[-1]["state"], "completed")
-        self.assertEqual((await terminal_events(holder))[-1]["state"], "completed")
+        now = 0.0
+        with patch.object(broker_module, "time", SimpleNamespace(monotonic=lambda: now)):
+            holder = self.broker.submit(dataclasses.replace(
+                spec("import time; time.sleep(.3)", label="holder", mode="shared"),
+                allowed_gpu_ids=(1,)))
+            await self.broker._schedule_jobs()
+            self.assertEqual(holder.gpu_ids, (1,))
+            exclusive = self.broker.submit(self.request((1,), queue_timeout_s=0.05))
+            shared = self.broker.submit(self.request((1,), mode="shared"))
+            now = 0.02
+            self.broker._expire_queued_jobs()
+            await self.broker._schedule_jobs()
+            self.assertEqual([exclusive.state, shared.state], ["queued", "queued"])
+            now = 0.05
+            self.broker._expire_queued_jobs()
+            await self.broker._schedule_jobs()
+            expired = await terminal_events(exclusive)
+            self.assertEqual(expired[-1]["state"], "queue_timeout")
+            self.assertEqual(expired[-1]["exit_code"], 124)
+            self.assertFalse(any(event["type"] == "started" for event in expired))
+            self.assertEqual(shared.gpu_ids, (1,))
+            self.assertEqual({job.job_id for job in self.broker._gpu_jobs[1]},
+                             {holder.job_id, shared.job_id})
+            self.assertEqual((await terminal_events(shared))[-1]["state"], "completed")
+            self.assertEqual((await terminal_events(holder))[-1]["state"], "completed")
 
     async def test_later_allocation_error_does_not_replay_an_already_started_worker(self):
         marker = self.root / "worker-executions"

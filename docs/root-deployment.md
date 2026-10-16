@@ -4,6 +4,28 @@ Run the broker as a dedicated unprivileged account, never as root. Every submitt
 command executes as the daemon account, so that account must contain no personal
 credentials and must not belong to `sudo`, `docker`, or other privileged groups.
 
+## MetaX deployment
+
+The shipped service templates keep the NVIDIA default. For MetaX, set
+`--backend metax` in the service command and specify the intended physical pool
+with `--gpus`. Keep one daemon and the existing physical-index lock directory.
+The service identity needs permission to run `mx-smi` and access the required
+MetaX device files. Do not grant broad privileged-group membership to bypass a
+device-access failure.
+
+Before enabling a service, verify that `mx-smi --show-all-process` sees external
+holders under that exact identity and process namespace, including zero-memory
+holders. Check an exclusive allocation on a nonzero physical card through the
+actual launch path using native device count and PCI identity. Check ordered
+multi-card selection, timeout, cancellation, and terminal child and lock release.
+If a container is involved, verify forwarding of both `MACA_VISIBLE_DEVICES` and
+`CUDA_VISIBLE_DEVICES` there. Generic command execution requires its own admitted
+container boundary; NVIDIA Docker `--gpus` is not a MACA adapter.
+
+Source support does not qualify a deployed daemon, Torch, an operator, or timing.
+The existing shared-packing policy does not separately attribute foreign PIDs on
+a card already held by broker jobs. Initial device qualification uses exclusive jobs.
+
 ## 1. Create the service identity and trusted client group
 
 ```bash

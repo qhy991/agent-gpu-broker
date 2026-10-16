@@ -20,12 +20,14 @@ async def until(predicate):
 
 
 class NvidiaProbeTests(unittest.IsolatedAsyncioTestCase):
+    command = "nvidia-smi"
+
     async def asyncSetUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
         self.addCleanup(self.temp.cleanup)
         self.pidfile = self.root / "pid"
-        shim = self.root / "nvidia-smi"
+        shim = self.root / self.command
         shim.write_text(
             f"#!{sys.executable}\nimport os,time\nfrom pathlib import Path\n"
             f"Path({str(self.pidfile)!r}).write_text(str(os.getpid()))\n"
@@ -51,20 +53,37 @@ class NvidiaProbeTests(unittest.IsolatedAsyncioTestCase):
         with mock.patch.object(gpu, "GPU_PROBE_TIMEOUT_S", 0.2), mock.patch.object(
             asyncio, "create_subprocess_exec", side_effect=spawn
         ):
-            with self.assertRaisesRegex(RuntimeError, "nvidia-smi timed out"):
-                await asyncio.wait_for(gpu._nvidia_smi("--query-gpu=index,uuid"), 3)
+            with self.assertRaisesRegex(RuntimeError, f"{self.command} timed out"):
+                await asyncio.wait_for(gpu._smi(self.command), 3)
         self.assertEqual(len(processes), 1)
         self.assertIsNotNone(processes[0].returncode)
         with self.assertRaises(ProcessLookupError):
             os.kill(processes[0].pid, 0)
 
     async def test_cancel_kills_and_reaps_probe(self):
-        task = asyncio.create_task(gpu._nvidia_smi())
+        task = asyncio.create_task(gpu._smi(self.command))
         await until(self.pidfile.exists)
         task.cancel()
         with self.assertRaises(asyncio.CancelledError):
             await asyncio.wait_for(task, 3)
         self.assert_reaped()
+
+    async def test_command_failure_is_not_an_empty_probe(self):
+        (self.root / self.command).write_text(
+            f"#!{sys.executable}\nimport sys\n"
+            "print('permission denied', file=sys.stderr)\nsys.exit(3)\n"
+        )
+        with self.assertRaisesRegex(RuntimeError, r"failed \(3\): permission denied"):
+            await gpu._smi(self.command)
+
+    async def test_missing_command_fails(self):
+        (self.root / self.command).unlink()
+        with self.assertRaises(FileNotFoundError):
+            await gpu._smi(self.command)
+
+
+class MetaXProbeTests(NvidiaProbeTests):
+    command = "mx-smi"
 
 
 class FailingInventory(FakeInventory):
