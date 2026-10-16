@@ -13,6 +13,7 @@ import unittest
 from pathlib import Path
 
 from agent_gpu_broker import __version__
+from agent_gpu_broker.gpu import NvidiaSmiInventory
 from agent_gpu_broker.broker import (
     ADMISSION_RECEIPT_SCHEMA,
     GpuBroker,
@@ -22,7 +23,7 @@ from agent_gpu_broker.broker import (
 )
 
 
-class FakeInventory:
+class FakeInventory(NvidiaSmiInventory):
     def __init__(self, gpu_ids=(0,)):
         self.ids = list(gpu_ids)
 
@@ -178,6 +179,7 @@ class HardeningTests(unittest.IsolatedAsyncioTestCase):
     async def test_preflight_rejects_inaccessible_cwd(self):
         secret = Path(self.temp.name) / "secret"
         secret.mkdir(mode=0o700)
+        secret.chmod(0o000)
         try:
             if os.access(secret, os.R_OK | os.X_OK):
                 self.skipTest("running as root: permission check cannot fail")
@@ -192,7 +194,7 @@ class HardeningTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("preflight", event["reason"])
             self.assertIn("cwd", event["reason"])
         finally:
-            secret.chmod(0o755)
+            secret.chmod(0o700)
 
     async def test_swallowed_failure_warning_on_fast_permission_error(self):
         secret = Path(self.temp.name) / "locked"

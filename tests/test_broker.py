@@ -9,10 +9,11 @@ from dataclasses import replace
 from unittest.mock import patch
 from pathlib import Path
 
+from agent_gpu_broker.gpu import NvidiaSmiInventory
 from agent_gpu_broker.broker import GpuBroker, JobSpec
 
 
-class FakeInventory:
+class FakeInventory(NvidiaSmiInventory):
     def __init__(self, gpu_ids=(0,), occupancy=None):
         self.ids = list(gpu_ids)
         self.occupancy = occupancy or {}

@@ -4,6 +4,23 @@ broker 必须使用专门的无特权账号运行，不能以 root 身份执行�
 继承 daemon 账号的身份，因此该账号不能保存个人凭据，也不能加入 `sudo`、
 `docker` 等特权用户组。
 
+## MetaX 部署
+
+仓库中的 service 模板保留 NVIDIA 默认值。MetaX 服务命令须显式设置
+`--backend metax`，并用 `--gpus` 指定物理设备池。保留单个 daemon 和现有物理编号
+锁目录。服务身份须能运行 `mx-smi` 并访问所需 MetaX 设备文件，不能通过加入宽泛
+特权组绕过设备访问失败。
+
+启用服务前，用准确的服务身份与进程命名空间验证 `mx-smi --show-all-process`
+能够观察外部持有进程，包括 0 MiB 的设备文件持有者。通过真实启动路径独占分配
+一张非零物理卡，用 native 设备数量和 PCI 身份核对映射；再核对多卡顺序、超时、
+取消及终态子进程和锁释放。容器路径须验证 `MACA_VISIBLE_DEVICES` 和
+`CUDA_VISIBLE_DEVICES` 的转发。通用命令执行需要独立准入的容器边界，NVIDIA
+Docker `--gpus` 不是 MACA 适配器。
+
+源代码支持不代表已部署 daemon、Torch、算子或计时已获资格。现有共享打包策略
+不会独立归因 broker 已持有卡上的外部 PID，初次设备验证使用独占作业。
+
 ## 1. 创建服务账号和可信客户端组
 
 ```bash

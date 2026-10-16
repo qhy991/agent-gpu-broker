@@ -11,13 +11,17 @@ import tempfile
 import time
 import uuid
 from collections import deque
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from . import __version__
-from .gpu import GPU_PROBE_TIMEOUT_S, CardLock, GpuInventory, NvidiaSmiInventory, try_card_lock
+from .gpu import (
+    GPU_PROBE_TIMEOUT_S, BackendId, CardLock, GpuInventory, NvidiaSmiInventory,
+    try_card_lock,
+)
 
 MODES = frozenset({"shared", "exclusive"})
 LAUNCH_SPEC_SCHEMA = "gpuq.launch-spec.v1"
@@ -25,8 +29,27 @@ ADMISSION_RECEIPT_SCHEMA = "gpuq.admission-receipt.v1"
 
 BROKER_VERSION = __version__
 ALLOCATION_ENVIRONMENT = "gpuq_v1"
-BACKEND = "nvidia"
 OCCUPANCY_SCOPE = "system"
+
+
+def _validate_occupancy(
+    occupancy: Mapping[int, Sequence[int]], *, required_ids: Sequence[int]
+) -> None:
+    if not isinstance(occupancy, Mapping):
+        raise RuntimeError("GPU occupancy must be a complete device map")
+    for gpu_id, pids in occupancy.items():
+        if type(gpu_id) is not int or gpu_id < 0:
+            raise RuntimeError("GPU occupancy contains an invalid device index")
+        if (
+            not isinstance(pids, Sequence)
+            or isinstance(pids, (str, bytes))
+            or any(type(pid) is not int or pid <= 0 for pid in pids)
+        ):
+            raise RuntimeError(f"GPU occupancy contains invalid PIDs for device {gpu_id}")
+    missing = sorted(set(required_ids) - occupancy.keys())
+    if missing:
+        raise RuntimeError(f"GPU occupancy missing managed devices: {missing}")
+
 
 # Jobs that exit this fast with a permission error in their stderr almost
 # always lost a race between admission and the workload's first file access
@@ -357,7 +380,7 @@ class GpuBroker:
                 raise RuntimeError(f"configured GPUs not discovered: {missing}")
             self._gpu_ids = list(self._configured_gpu_ids)
         if not self._gpu_ids:
-            raise RuntimeError("no NVIDIA GPUs discovered or configured")
+            raise RuntimeError(f"no {self._inventory.backend.value} GPUs discovered or configured")
         if len(set(self._gpu_ids)) != len(self._gpu_ids):
             raise RuntimeError("configured GPU indices must be unique")
         self._scheduler = asyncio.create_task(
@@ -494,7 +517,7 @@ class GpuBroker:
             "version": 2,
             "broker_version": BROKER_VERSION,
             "allocation_environment": ALLOCATION_ENVIRONMENT,
-            "backend": BACKEND,
+            "backend": self._inventory.backend.value,
             "occupancy_scope": OCCUPANCY_SCOPE,
             "external_occupancy": "unknown" if self._probe_error else "observed",
             "instance_id": self._instance_id,
@@ -598,6 +621,7 @@ class GpuBroker:
     async def _schedule_jobs(self) -> None:
         try:
             occupancy = await self._inventory.compute_pids()
+            _validate_occupancy(occupancy, required_ids=self._gpu_ids)
         except Exception as exc:  # fail closed when cleanliness is unknown
             self._mark_gpu_unavailable(str(exc))
             return
@@ -657,7 +681,7 @@ class GpuBroker:
                 for gpu_id in eligible
                 if gpu_id not in self._gpu_jobs
                 and gpu_id not in selected
-                and not occupancy.get(gpu_id, [])
+                and not occupancy[gpu_id]
             ]
             for gpu_id in free_cards:
                 card_lock = try_card_lock(gpu_id, self._lock_dir)
@@ -711,7 +735,7 @@ class GpuBroker:
                 observation[gpu_id] = value
                 continue
 
-            pids = occupancy.get(gpu_id, [])
+            pids = occupancy[gpu_id]
             if pids:
                 observation[gpu_id] = {"state": "foreign", "pids": pids}
                 continue
@@ -744,21 +768,19 @@ class GpuBroker:
                 raise RuntimeError(
                     "admission drift: executable path or content changed before start"
                 )
-            # Disk JIT cache has exactly the lifetime of this device process.
-            # HOME may be task-owned, but it must not accumulate one driver cache
-            # per candidate; never share a warm cache across measurements.
-            cuda_cache = tempfile.TemporaryDirectory(prefix=f"gpuq-{job.job_id}-cuda-")
-            environment = {
-                **os.environ,
-                **job.spec.env,
-                "CUDA_CACHE_PATH": cuda_cache.name,
-                "CUDA_VISIBLE_DEVICES": ",".join(map(str, job.gpu_ids)),
+            environment = self._inventory.child_environment(
+                {**os.environ, **job.spec.env}, physical_ids=job.gpu_ids
+            )
+            if self._inventory.backend is BackendId.NVIDIA:
+                cuda_cache = tempfile.TemporaryDirectory(prefix=f"gpuq-{job.job_id}-cuda-")
+                environment["CUDA_CACHE_PATH"] = cuda_cache.name
+            environment.update({
                 "GPUQ_JOB_ID": job.job_id,
                 "GPUQ_MODE": job.spec.mode,
-                "GPUQ_BACKEND": BACKEND,
+                "GPUQ_BACKEND": self._inventory.backend.value,
                 "GPUQ_DEVICE_IDS": ",".join(map(str, job.gpu_ids)),
                 "GPUQ_OCCUPANCY_SCOPE": OCCUPANCY_SCOPE,
-            }
+            })
             job.effective_env_sha256 = digest_json(environment)
             self._store.record_admission(job)
             spawn = asyncio.create_task(

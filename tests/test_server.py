@@ -7,11 +7,12 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from agent_gpu_broker.gpu import NvidiaSmiInventory
 from agent_gpu_broker.broker import GpuBroker
 from agent_gpu_broker.server import BrokerServer
 
 
-class FakeInventory:
+class FakeInventory(NvidiaSmiInventory):
     async def gpu_ids(self):
         return [0]
 

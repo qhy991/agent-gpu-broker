@@ -11,13 +11,14 @@
 
 ## CUDA 缓存生命周期
 
-broker 为每个开始执行的作业分配唯一 `CUDA_CACHE_PATH`，替换继承或请求中的
+NVIDIA 后端为每个开始执行的作业分配唯一 `CUDA_CACHE_PATH`，替换继承或请求中的
 缓存路径；实际环境摘要绑定到 admission 回执，环境值不写入回执。排队作业不创建
 缓存。作业内部继续使用自己的缓存与 warmup，不与其他作业共享已预热缓存。
 成功、失败、执行超时或取消后，broker 回收进程、释放 GPU，再删除自己的临时驱动
 缓存；GPU 执行时长不包含清理时间。候选、日志、profiler 报告和回执不属于清理目标。
 清理失败在终态 `cuda_cache_cleanup` 中明确记录，不改变任务结果或滞留分配。
 容器启动器应使用容器内临时缓存，或转发挂载的 broker 缓存，避免写入持久任务 HOME。
+MetaX 后端不创建此缓存，也不输出 `cuda_cache_cleanup`。
 
 `agent-gpu-broker` 是一个面向编程 Agent 的单机全局 GPU 队列。Agent 只需保持
 一条普通的 `gpu-run` 命令运行，broker 就会在同一次调用中持续返回队列位置、
@@ -80,6 +81,25 @@ bin/gpuq serve \
 
 默认自动扫描机器上的全部 NVIDIA GPU，并跳过存在外部计算进程或外部锁的卡。
 可以通过 `--gpus 1,2` 将 broker 限制在指定的物理 GPU 上。
+
+MetaX 在 daemon 启动时显式选择后端，省略 `--backend` 仍使用 NVIDIA：
+
+```bash
+bin/gpuq serve --backend metax --gpus 0,1,2,3
+```
+
+同一个 inventory 拥有后端身份、设备发现、占用探测和子进程选择器。MetaX 使用
+`mx-smi --list` 与 `mx-smi --show-all-process`，要求完整报告；即使显存为 0 MiB，
+设备文件持有进程也视为占用。未知格式、设备缺失或 attached 数量变化会阻止分配。
+物理设备集合在启动时固定，拓扑变化须先调查再重启。
+
+MetaX 按实际分配顺序覆盖继承及请求中的 `MACA_VISIBLE_DEVICES` 和
+`CUDA_VISIBLE_DEVICES`。状态和 `GPUQ_BACKEND` 为 `metax`，`GPUQ_DEVICE_IDS`
+保留物理编号，v1 admission 回执格式不变。CPU 测试只证明解析和 broker 行为。
+部署前必须用实际服务身份与进程命名空间验证占用可见性，并通过真实子进程或容器
+路径核对 native 设备数量与 PCI 映射。容器启动器须转发两个选择器，CUDA Docker
+`--gpus` 路径不能证明 MACA 隔离；Torch 执行仍需独立准入。
+具体要求见 [部署指南](docs/root-deployment.zh-CN.md#metax-部署)。
 
 如果由单个 Unix 账号使用，并将仓库放在 `~/agent-gpu-broker`，可以安装仓库内的
 systemd 用户服务：
@@ -175,7 +195,7 @@ ETA 是根据任务声明的 `--estimate`、GPU 数量、共享槽位和正在�
 
 ## GPU 探测健康状态
 
-每次 `nvidia-smi` 有 10 秒限时；超时或取消会终止并回收该探测子进程。探测失败
+每次 `nvidia-smi` 或 `mx-smi` 有 10 秒限时；超时或取消会终止并回收该探测子进程。探测失败
 不释放已有作业的 GPU 租约；调度器仍处理队列超时，并在下一轮正常轮询重试。
 单次调度异常会被报告，不会让整个循环静默退出。
 
